@@ -11,9 +11,10 @@ import (
 // fakeEmbedder maps substrings to fixed vectors so tests control similarity
 // exactly. The first matching rule wins; unmatched text gets a zero vector.
 type fakeEmbedder struct {
-	rules []fakeRule
-	fail  error
-	calls int
+	rules           []fakeRule
+	fail            error
+	calls           int
+	lastHadDeadline bool
 }
 
 type fakeRule struct {
@@ -21,8 +22,9 @@ type fakeRule struct {
 	vec    []float32
 }
 
-func (f *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (f *fakeEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	f.calls++
+	_, f.lastHadDeadline = ctx.Deadline()
 	if f.fail != nil {
 		return nil, f.fail
 	}
@@ -260,6 +262,135 @@ func TestBackfillEmbeddings(t *testing.T) {
 	done, err = s.BackfillEmbeddings(context.Background(), 10, nil)
 	if err != nil || done != 0 {
 		t.Errorf("second backfill = (%d, %v), want (0, nil)", done, err)
+	}
+}
+
+func TestDuplicateBumpSkipsReembed(t *testing.T) {
+	s := newVectorTestStore(t)
+	fe := &fakeEmbedder{rules: []fakeRule{{substr: "auth", vec: []float32{1, 0, 0}}}}
+	s.SetEmbedder(fe)
+
+	first := addObs(t, s, "auth flow", "OAuth2 with PKCE")
+	if fe.calls != 1 {
+		t.Fatalf("embed calls after first save = %d, want 1", fe.calls)
+	}
+	if !fe.lastHadDeadline {
+		t.Error("save-path embed ran without a deadline — slow backend would hold the write queue")
+	}
+
+	// Identical save inside the dedupe window: pure duplicate bump, vector
+	// already stored → no embedding round-trip.
+	second := addObs(t, s, "auth flow", "OAuth2 with PKCE")
+	if second != first {
+		t.Fatalf("expected dedupe to reuse row %d, got %d", first, second)
+	}
+	if fe.calls != 1 {
+		t.Errorf("embed calls after duplicate bump = %d, want 1 (no re-embed)", fe.calls)
+	}
+}
+
+func TestDuplicateBumpEmbedsWhenVectorMissing(t *testing.T) {
+	s := newVectorTestStore(t)
+	fe := &fakeEmbedder{fail: errors.New("backend down"), rules: []fakeRule{{substr: "auth", vec: []float32{1, 0, 0}}}}
+	s.SetEmbedder(fe)
+
+	// First save: backend down, row stored without a vector.
+	first := addObs(t, s, "auth flow", "OAuth2 with PKCE")
+
+	// Backend recovers; the duplicate bump should notice the missing vector
+	// and embed it rather than skipping.
+	fe.fail = nil
+	second := addObs(t, s, "auth flow", "OAuth2 with PKCE")
+	if second != first {
+		t.Fatalf("expected dedupe to reuse row %d, got %d", first, second)
+	}
+	var model *string
+	if err := s.db.QueryRow(`SELECT embedding_model FROM observations WHERE id = ?`, first).Scan(&model); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if model == nil || *model != "fake-model" {
+		t.Errorf("embedding_model = %v, want fake-model (dup bump should backfill missing vector)", model)
+	}
+}
+
+func TestSearchWithInfoReportsModeAndDegradation(t *testing.T) {
+	s := newVectorTestStore(t)
+	addObs(t, s, "database schema", "twelve tables")
+
+	// No embedder: auto mode is lexical, not degraded.
+	_, info, err := s.SearchWithInfo("database", SearchOptions{Project: "engram"})
+	if err != nil {
+		t.Fatalf("lexical search: %v", err)
+	}
+	if info.Mode != SearchModeLexical || info.Degraded {
+		t.Errorf("no-embedder info = %+v, want lexical/not-degraded", info)
+	}
+
+	// Healthy embedder: auto mode is hybrid.
+	fe := &fakeEmbedder{rules: []fakeRule{{substr: "database", vec: []float32{0, 1, 0}}}}
+	s.SetEmbedder(fe)
+	_, info, err = s.SearchWithInfo("database", SearchOptions{Project: "engram"})
+	if err != nil {
+		t.Fatalf("hybrid search: %v", err)
+	}
+	if info.Mode != SearchModeHybrid || info.Degraded {
+		t.Errorf("healthy info = %+v, want hybrid/not-degraded", info)
+	}
+
+	// Backend dies: hybrid degrades to lexical and says so.
+	fe.fail = errors.New("ollama went away")
+	results, info, err := s.SearchWithInfo("database", SearchOptions{Project: "engram"})
+	if err != nil {
+		t.Fatalf("degraded search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("degraded results = %+v, want lexical hit", summarize(results))
+	}
+	if !info.Degraded || info.Mode != SearchModeLexical || !strings.Contains(info.DegradedReason, "ollama went away") {
+		t.Errorf("degraded info = %+v, want lexical/degraded with reason", info)
+	}
+}
+
+func TestCorruptVectorSelfHeals(t *testing.T) {
+	s := newVectorTestStore(t)
+	fe := &fakeEmbedder{rules: []fakeRule{
+		{substr: "how do users sign in", vec: []float32{1, 0, 0}},
+		{substr: "authentication", vec: []float32{0.95, 0.05, 0}},
+	}}
+	s.SetEmbedder(fe)
+
+	id := addObs(t, s, "authentication design", "sessions carried in cookies")
+
+	// Corrupt the stored blob (length not divisible by 4).
+	if _, err := s.db.Exec(`UPDATE observations SET embedding = X'010203' WHERE id = ?`, id); err != nil {
+		t.Fatalf("corrupt blob: %v", err)
+	}
+
+	// Semantic search skips the corrupt row but must clear it so backfill
+	// can see it again.
+	results, _, err := s.SearchWithInfo("how do users sign in", SearchOptions{Mode: SearchModeSemantic, Project: "engram"})
+	if err != nil {
+		t.Fatalf("semantic search over corrupt row: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %+v, want none (only candidate was corrupt)", summarize(results))
+	}
+	var blob []byte
+	var model *string
+	if err := s.db.QueryRow(`SELECT embedding, embedding_model FROM observations WHERE id = ?`, id).Scan(&blob, &model); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if blob != nil || model != nil {
+		t.Fatalf("corrupt vector not cleared (embedding=%v model=%v) — row would be invisible to backfill forever", blob, model)
+	}
+
+	// Backfill now repairs it and semantic search finds it again.
+	if done, err := s.BackfillEmbeddings(context.Background(), 10, nil); err != nil || done != 1 {
+		t.Fatalf("backfill = (%d, %v), want (1, nil)", done, err)
+	}
+	results, _, err = s.SearchWithInfo("how do users sign in", SearchOptions{Mode: SearchModeSemantic, Project: "engram"})
+	if err != nil || len(results) != 1 || results[0].ID != id {
+		t.Fatalf("post-heal search = (%+v, %v), want the repaired row", summarize(results), err)
 	}
 }
 

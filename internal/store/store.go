@@ -2266,6 +2266,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	topicKey := normalizeTopicKey(p.TopicKey)
 
 	var observationID int64
+	var dupBump bool // true when the save was a pure duplicate_count bump (content unchanged)
 	err := s.withTx(func(tx *sql.Tx) error {
 		var obs *Observation
 		if topicKey != "" {
@@ -2331,6 +2332,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			normHash, nullableString(p.Project), scope, p.Type, title, window,
 		).Scan(&existingID)
 		if err == nil {
+			dupBump = true
 			if _, err := s.execHook(tx,
 				`UPDATE observations
 				 SET duplicate_count = duplicate_count + 1,
@@ -2392,10 +2394,25 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 	// Best-effort semantic indexing: a save must never fail because the
 	// embedding backend is down. Rows missed here are picked up by
-	// `engram embed backfill`.
+	// `engram embed backfill`. Pure duplicate bumps skip the round-trip —
+	// the content is unchanged, so the stored vector is already correct —
+	// unless the row has no vector yet (e.g. saved while the backend was
+	// down).
 	if s.embedder != nil {
-		if embErr := s.embedObservation(observationID, title, content); embErr != nil {
-			warnEmbedUnavailable(embErr)
+		needsEmbed := !dupBump
+		if dupBump {
+			var embedded bool
+			if qErr := s.db.QueryRow(
+				`SELECT embedding IS NOT NULL AND embedding_model = ? FROM observations WHERE id = ?`,
+				s.embedder.Model(), observationID,
+			).Scan(&embedded); qErr == nil {
+				needsEmbed = !embedded
+			}
+		}
+		if needsEmbed {
+			if embErr := s.embedObservation(observationID, title, content); embErr != nil {
+				warnEmbedUnavailable(embErr)
+			}
 		}
 	}
 
@@ -3112,18 +3129,27 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	results, _, err := s.SearchWithInfo(query, opts)
+	return results, err
+}
+
+// SearchWithInfo is Search plus a SearchInfo describing how the request was
+// actually served (which mode, and whether the semantic leg degraded), so
+// callers can surface silent hybrid→lexical fallbacks to the user.
+func (s *Store) SearchWithInfo(query string, opts SearchOptions) ([]SearchResult, SearchInfo, error) {
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
 	case "", "all", "any":
 		// valid
 	default:
-		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
+		return nil, SearchInfo{}, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
 	}
 
 	mode, err := s.resolveSearchMode(opts.Mode)
 	if err != nil {
-		return nil, err
+		return nil, SearchInfo{}, err
 	}
+	info := SearchInfo{Mode: mode}
 
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
@@ -3187,10 +3213,13 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		semanticResults, err = s.searchSemantic(query, opts, limit)
 		if err != nil {
 			if mode == SearchModeSemantic {
-				return nil, err
+				return nil, SearchInfo{}, err
 			}
 			warnEmbedUnavailable(err)
 			semanticResults = nil
+			info.Mode = SearchModeLexical
+			info.Degraded = true
+			info.DegradedReason = err.Error()
 		}
 		if mode == SearchModeSemantic {
 			seen := make(map[int64]bool)
@@ -3207,7 +3236,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			if len(results) > limit {
 				results = results[:limit]
 			}
-			return results, nil
+			return results, info, nil
 		}
 	}
 
@@ -3249,7 +3278,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	rows, err := s.queryItHook(s.db, sqlQ, args...)
 	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+		return nil, SearchInfo{}, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
 
@@ -3267,14 +3296,14 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
-			return nil, err
+			return nil, SearchInfo{}, err
 		}
 		if !seen[sr.ID] {
 			ftsResults = append(ftsResults, sr)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, SearchInfo{}, err
 	}
 
 	var results []SearchResult
@@ -3296,7 +3325,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	if len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
+	return results, info, nil
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────

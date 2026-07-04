@@ -1018,7 +1018,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
 
-		results, err := s.Search(query, store.SearchOptions{
+		results, searchInfo, err := s.SearchWithInfo(query, store.SearchOptions{
 			Type:      typ,
 			Project:   searchProject,
 			Scope:     scope,
@@ -1027,12 +1027,21 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			Mode:      mode,
 		})
 		if err != nil {
+			// Configuration/mode errors carry their own actionable guidance;
+			// the keyword hint only applies to FTS query-shaped errors.
+			if strings.Contains(err.Error(), "requires embeddings") || strings.Contains(err.Error(), "invalid mode") {
+				return mcp.NewToolResultError(fmt.Sprintf("Search error: %s", err)), nil
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
 		}
 
 		if len(results) == 0 {
 			// JW4: use respondWithProject even for empty results.
-			return respondWithProject(detRes, fmt.Sprintf("No memories found for: %q", query), nil), nil
+			msg := fmt.Sprintf("No memories found for: %q", query)
+			if searchInfo.Degraded {
+				msg += fmt.Sprintf("\n\nNote: semantic ranking was unavailable (%s) — this was a keyword-only search, so a memory phrased differently may still exist. Retry once the embedding backend is back.", searchInfo.DegradedReason)
+			}
+			return respondWithProject(detRes, msg, nil), nil
 		}
 
 		// Batch-load relations for all results (REQ-002). Avoids N+1.
@@ -1051,7 +1060,11 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		if searchInfo.Degraded {
+			fmt.Fprintf(&b, "Found %d memories (mode: %s — semantic ranking unavailable: %s):\n\n", len(results), searchInfo.Mode, searchInfo.DegradedReason)
+		} else {
+			fmt.Fprintf(&b, "Found %d memories (mode: %s):\n\n", len(results), searchInfo.Mode)
+		}
 		anyTruncated := false
 		structuredResults := make([]map[string]any, 0, len(results))
 		for i, r := range results {
@@ -1145,7 +1158,12 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 
 		// JW4: use respondWithProject for the success path (REQ-314).
-		return respondWithProject(detRes, b.String(), map[string]any{"results": structuredResults}), nil
+		structured := map[string]any{"results": structuredResults, "search_mode": searchInfo.Mode}
+		if searchInfo.Degraded {
+			structured["degraded"] = true
+			structured["degraded_reason"] = searchInfo.DegradedReason
+		}
+		return respondWithProject(detRes, b.String(), structured), nil
 	}
 }
 

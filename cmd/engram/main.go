@@ -100,8 +100,8 @@ var (
 	setupAddClaudeCodeAllowlist = setup.AddClaudeCodeAllowlist
 	scanInputLine               = fmt.Scanln
 
-	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
-		return s.Search(query, opts)
+	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, store.SearchInfo, error) {
+		return s.SearchWithInfo(query, opts)
 	}
 	storeAddObservation    = func(s *store.Store, p store.AddObservationParams) (int64, error) { return s.AddObservation(p) }
 	storeDeleteObservation = func(s *store.Store, id int64, hard bool) error { return s.DeleteObservation(id, hard) }
@@ -725,8 +725,29 @@ func handleConfigFreeCommand(args []string) bool {
 	return false
 }
 
+// isForkBuild reports whether this binary is the local semantic-search fork
+// (version stamped with "-semantic" via ldflags at build time).
+func isForkBuild() bool {
+	return strings.Contains(version, "semantic")
+}
+
 func printUpdateCheckResult(result versioncheck.CheckResult) {
-	if result.Status != versioncheck.StatusUpToDate && result.Message != "" {
+	if result.Status == versioncheck.StatusUpToDate {
+		return
+	}
+	// Fork guard: this binary is the standalone semantic-search fork, and
+	// /opt/homebrew/bin/engram is a symlink into the fork's dist/. Following
+	// upstream's normal update advice (`brew upgrade engram`) would replace
+	// that symlink and silently revert to a build without semantic search.
+	if isForkBuild() && result.Status == versioncheck.StatusUpdateAvailable {
+		fmt.Fprintln(os.Stderr, "engram: upstream has released a newer version, but you are running the local semantic-search fork.")
+		fmt.Fprintln(os.Stderr, "  DO NOT run `brew upgrade engram` — it would replace this fork with a build that has no semantic search.")
+		fmt.Fprintln(os.Stderr, "  To take the upstream update: rebase the fork (~/Documents/GitHub/engram, branch feature/semantic-search),")
+		fmt.Fprintln(os.Stderr, "  then rebuild: go build -o dist/engram ./cmd/engram")
+		fmt.Fprintln(os.Stderr)
+		return
+	}
+	if result.Message != "" {
 		fmt.Fprintln(os.Stderr, result.Message)
 		fmt.Fprintln(os.Stderr)
 	}
@@ -990,18 +1011,23 @@ func cmdSearch(cfg store.Config) {
 	}
 	defer s.Close()
 
-	results, err := storeSearch(s, query, opts)
+	results, searchInfo, err := storeSearch(s, query, opts)
 	if err != nil {
 		fatal(err)
 		return
 	}
 
+	modeNote := searchInfo.Mode
+	if searchInfo.Degraded {
+		modeNote = fmt.Sprintf("%s — semantic ranking unavailable (%s); keyword results only", searchInfo.Mode, searchInfo.DegradedReason)
+	}
+
 	if len(results) == 0 {
-		fmt.Printf("No memories found for: %q\n", query)
+		fmt.Printf("No memories found for: %q (mode: %s)\n", query, modeNote)
 		return
 	}
 
-	fmt.Printf("Found %d memories:\n\n", len(results))
+	fmt.Printf("Found %d memories (mode: %s):\n\n", len(results), modeNote)
 	for i, r := range results {
 		project := ""
 		if r.Project != nil {
