@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/embed"
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
@@ -180,6 +181,7 @@ type SearchOptions struct {
 	Scope     string `json:"scope,omitempty"`
 	Limit     int    `json:"limit,omitempty"`
 	MatchMode string `json:"match_mode,omitempty"` // "all" (default) | "any"
+	Mode      string `json:"mode,omitempty"`       // "" (auto) | "lexical" | "semantic" | "hybrid" — see vector.go
 }
 
 type AddObservationParams struct {
@@ -486,9 +488,10 @@ func (s *Store) MaxObservationLength() int {
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 type Store struct {
-	db    *sql.DB
-	cfg   Config
-	hooks storeHooks
+	db       *sql.DB
+	cfg      Config
+	hooks    storeHooks
+	embedder Embedder // optional; nil disables semantic search (see vector.go)
 }
 
 type execer interface {
@@ -643,6 +646,10 @@ func New(cfg Config) (*Store, error) {
 	}
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
+	}
+
+	if c := embed.FromEnv(); c != nil {
+		s.embedder = c
 	}
 
 	return s, nil
@@ -2387,6 +2394,16 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Best-effort semantic indexing: a save must never fail because the
+	// embedding backend is down. Rows missed here are picked up by
+	// `engram embed backfill`.
+	if s.embedder != nil {
+		if embErr := s.embedObservation(observationID, title, content); embErr != nil {
+			warnEmbedUnavailable(embErr)
+		}
+	}
+
 	return observationID, nil
 }
 
@@ -3108,6 +3125,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
 	}
 
+	mode, err := s.resolveSearchMode(opts.Mode)
+	if err != nil {
+		return nil, err
+	}
+
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
 
@@ -3162,6 +3184,38 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 	}
 
+	// Semantic path: cosine similarity over stored embeddings (vector.go). In
+	// hybrid mode a backend failure degrades to lexical-only rather than
+	// failing the search; in explicit semantic mode the error propagates.
+	var semanticResults []SearchResult
+	if mode == SearchModeSemantic || mode == SearchModeHybrid {
+		semanticResults, err = s.searchSemantic(query, opts, limit)
+		if err != nil {
+			if mode == SearchModeSemantic {
+				return nil, err
+			}
+			warnEmbedUnavailable(err)
+			semanticResults = nil
+		}
+		if mode == SearchModeSemantic {
+			seen := make(map[int64]bool)
+			results := make([]SearchResult, 0, len(directResults)+len(semanticResults))
+			for _, dr := range directResults {
+				seen[dr.ID] = true
+				results = append(results, dr)
+			}
+			for _, sr := range semanticResults {
+				if !seen[sr.ID] {
+					results = append(results, sr)
+				}
+			}
+			if len(results) > limit {
+				results = results[:limit]
+			}
+			return results, nil
+		}
+	}
+
 	// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
 	var ftsQuery string
 	if opts.MatchMode == "any" {
@@ -3209,8 +3263,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		seen[dr.ID] = true
 	}
 
-	var results []SearchResult
-	results = append(results, directResults...)
+	var ftsResults []SearchResult
 	for rows.Next() {
 		var sr SearchResult
 		if err := rows.Scan(
@@ -3222,11 +3275,27 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			return nil, err
 		}
 		if !seen[sr.ID] {
-			results = append(results, sr)
+			ftsResults = append(ftsResults, sr)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+
+	var results []SearchResult
+	results = append(results, directResults...)
+	if mode == SearchModeHybrid && len(semanticResults) > 0 {
+		// Fuse lexical and semantic rankings; direct topic-key matches stay
+		// pinned above the fused list.
+		var semantic []SearchResult
+		for _, sr := range semanticResults {
+			if !seen[sr.ID] {
+				semantic = append(semantic, sr)
+			}
+		}
+		results = append(results, rrfMerge([][]SearchResult{ftsResults, semantic}, limit)...)
+	} else {
+		results = append(results, ftsResults...)
 	}
 
 	if len(results) > limit {

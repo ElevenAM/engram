@@ -32,6 +32,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/internal/cloud/syncguidance"
 	"github.com/Gentleman-Programming/engram/internal/diagnostic"
+	"github.com/Gentleman-Programming/engram/internal/embed"
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
 	"github.com/Gentleman-Programming/engram/internal/project"
@@ -656,6 +657,8 @@ func main() {
 		cmdCloud(cfg)
 	case "obsidian-export":
 		cmdObsidianExport(cfg)
+	case "embed":
+		cmdEmbed(cfg)
 	case "projects":
 		cmdProjects(cfg)
 	case "setup":
@@ -918,7 +921,7 @@ func cmdTUI(cfg store.Config) {
 
 func cmdSearch(cfg store.Config) {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]")
+		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N] [--mode lexical|semantic|hybrid]")
 		exitFunc(1)
 	}
 
@@ -948,6 +951,11 @@ func cmdSearch(cfg store.Config) {
 		case "--scope":
 			if i+1 < len(os.Args) {
 				opts.Scope = os.Args[i+1]
+				i++
+			}
+		case "--mode":
+			if i+1 < len(os.Args) {
+				opts.Mode = os.Args[i+1]
 				i++
 			}
 		default:
@@ -989,6 +997,80 @@ func cmdSearch(cfg store.Config) {
 			i+1, r.ID, r.Type, r.Title,
 			truncate(r.Content, 300),
 			timeutil.FormatLocal(r.CreatedAt), project, r.Scope)
+	}
+}
+
+func cmdEmbed(cfg store.Config) {
+	sub := ""
+	if len(os.Args) >= 3 {
+		sub = os.Args[2]
+	}
+
+	switch sub {
+	case "status":
+		s, err := storeNew(cfg)
+		if err != nil {
+			fatal(err)
+			return
+		}
+		defer s.Close()
+
+		stats, err := s.GetEmbeddingStats()
+		if err != nil {
+			fatal(err)
+			return
+		}
+		if c := embed.FromEnv(); c != nil {
+			fmt.Printf("Embeddings: enabled (model: %s)\n", c.Model())
+		} else {
+			fmt.Println("Embeddings: disabled — set ENGRAM_EMBEDDINGS=ollama to enable")
+		}
+		fmt.Printf("Active observations: %d\n", stats.ActiveObservations)
+		fmt.Printf("Embedded:            %d\n", stats.Embedded)
+		for model, n := range stats.Models {
+			fmt.Printf("  %s: %d\n", model, n)
+		}
+		if missing := stats.ActiveObservations - stats.Embedded; missing > 0 {
+			fmt.Printf("Missing:             %d (run `engram embed backfill`)\n", missing)
+		}
+
+	case "backfill":
+		batch := 32
+		for i := 3; i < len(os.Args); i++ {
+			if os.Args[i] == "--batch" && i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					batch = n
+				}
+				i++
+			}
+		}
+		if embed.FromEnv() == nil {
+			fmt.Fprintln(os.Stderr, "error: embeddings not configured — set ENGRAM_EMBEDDINGS=ollama")
+			exitFunc(1)
+			return
+		}
+		s, err := storeNew(cfg)
+		if err != nil {
+			fatal(err)
+			return
+		}
+		defer s.Close()
+
+		done, err := s.BackfillEmbeddings(context.Background(), batch, func(done int64) {
+			fmt.Printf("\rEmbedded %d observations...", done)
+		})
+		if done > 0 {
+			fmt.Println()
+		}
+		if err != nil {
+			fatal(err)
+			return
+		}
+		fmt.Printf("Backfill complete: %d observations embedded.\n", done)
+
+	default:
+		fmt.Fprintln(os.Stderr, "usage: engram embed <status|backfill> [--batch N]")
+		exitFunc(1)
 	}
 }
 
@@ -2454,6 +2536,8 @@ Commands:
                                        Also accepted as ENGRAM_PROJECT=NAME env var.
   tui                Launch interactive terminal UI
   search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
+                       [--mode lexical|semantic|hybrid]  Ranking mode (default: hybrid when
+                       ENGRAM_EMBEDDINGS is configured, lexical otherwise)
   save <title> <msg> Save a memory  [--type TYPE] [--project PROJECT] [--scope SCOPE]
   delete <obs_id>    Delete an observation [--hard] (soft-delete by default; --hard removes permanently)
   delete session <id>
@@ -2496,6 +2580,9 @@ Commands:
 	                        enroll     Enroll a project for cloud sync
 	                        config     Set cloud server URL
 	                        serve      Run cloud backend + dashboard
+  embed <subcommand> Semantic-search embeddings (requires ENGRAM_EMBEDDINGS=ollama)
+                       status     Show embedding coverage per model
+                       backfill   Embed all observations that have no vector yet [--batch N]
   obsidian-export    Export memories to an Obsidian-compatible markdown vault
                        --vault         Path to Obsidian vault root (required)
                        --project       Filter export to a single project (optional)
@@ -2525,6 +2612,13 @@ Environment:
                      Accepts any IANA zone name (e.g. America/New_York, Europe/Berlin).
                      Falls back to system local time when unset or invalid.
   ENGRAM_AGENT_CLI   LLM runner for conflicts scan --semantic (claude or opencode)
+  ENGRAM_EMBEDDINGS  Set to "ollama" to enable semantic/hybrid search via a local
+                     Ollama server. Saves embed automatically; run "engram embed
+                     backfill" once for existing memories. Unset = lexical only.
+  ENGRAM_EMBEDDINGS_URL
+                     Ollama base URL (default: http://localhost:11434)
+  ENGRAM_EMBEDDINGS_MODEL
+                     Embedding model (default: all-minilm)
   ENGRAM_CLOUD_AUTOSYNC
                      Set to 1 to enable background autosync; also requires
                      ENGRAM_CLOUD_TOKEN and ENGRAM_CLOUD_SERVER
