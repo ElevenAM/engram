@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/embed"
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
@@ -646,10 +645,6 @@ func New(cfg Config) (*Store, error) {
 	}
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
-	}
-
-	if c := embed.FromEnv(); c != nil {
-		s.embedder = c
 	}
 
 	return s, nil

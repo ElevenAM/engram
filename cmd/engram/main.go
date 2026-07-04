@@ -61,8 +61,22 @@ func init() {
 	}
 }
 
+// newStoreFromEnv opens the store and attaches the embedding backend when
+// ENGRAM_EMBEDDINGS is configured. Env wiring lives here at the app boundary
+// (not in store.New) so the store package stays hermetic under test.
+func newStoreFromEnv(cfg store.Config) (*store.Store, error) {
+	s, err := store.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if c := embed.FromEnv(); c != nil {
+		s.SetEmbedder(c)
+	}
+	return s, nil
+}
+
 var (
-	storeNew      = store.New
+	storeNew      = newStoreFromEnv
 	newHTTPServer = server.New
 	startHTTP     = (*server.Server).Start
 
