@@ -286,6 +286,9 @@ func registerTools(srv *server.MCPServer, s *store.Store, cfg MCPConfig, allowli
 				mcp.WithString("match_mode",
 					mcp.Description("Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error."),
 				),
+				mcp.WithString("mode",
+					mcp.Description("Ranking mode: \"hybrid\" (semantic + keyword, default when embeddings are configured), \"semantic\" (meaning-based only — finds paraphrases with no keyword overlap), or \"lexical\" (keyword FTS5 only, the default when embeddings are not configured). Leave unset for auto."),
+				),
 				mcp.WithNumber("limit",
 					mcp.Description("Max results (default: 10, max: 20)"),
 				),
@@ -963,12 +966,18 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		projectOverride, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		matchMode, _ := req.GetArguments()["match_mode"].(string)
+		mode, _ := req.GetArguments()["mode"].(string)
 		allProjects := boolArg(req, "all_projects", false)
 		limit := intArg(req, "limit", 10)
 
 		// Validate match_mode before any project resolution or DB work.
 		if matchMode != "" && matchMode != "all" && matchMode != "any" {
 			return mcp.NewToolResultError(fmt.Sprintf("invalid match_mode %q: must be \"all\" or \"any\"", matchMode)), nil
+		}
+		switch mode {
+		case "", store.SearchModeLexical, store.SearchModeSemantic, store.SearchModeHybrid:
+		default:
+			return mcp.NewToolResultError(fmt.Sprintf("invalid mode %q: must be \"lexical\", \"semantic\", or \"hybrid\"", mode)), nil
 		}
 
 		// all_projects=true short-circuits project resolution: we search globally
@@ -1015,6 +1024,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			Scope:     scope,
 			Limit:     limit,
 			MatchMode: matchMode,
+			Mode:      mode,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
