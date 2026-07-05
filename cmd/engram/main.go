@@ -115,9 +115,12 @@ var (
 	}
 	storeFormatContext = func(s *store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
 	storeStats         = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
-	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
-	jsonMarshalIndent  = json.MarshalIndent
-	runDiagnostics     = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
+	storePrune         = func(s *store.Store, project, typeFilter string, limit int) ([]store.Observation, error) {
+		return s.ObservationsPastDecay(project, typeFilter, limit)
+	}
+	storeExport       = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+	jsonMarshalIndent = json.MarshalIndent
+	runDiagnostics    = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
 		runner := diagnostic.NewRunner()
 		scope := diagnostic.Scope{Store: s, Project: project, Now: time.Now()}
 		if strings.TrimSpace(check) != "" {
@@ -661,6 +664,8 @@ func main() {
 		cmdContext(cfg)
 	case "stats":
 		cmdStats(cfg)
+	case "prune":
+		cmdPrune(cfg)
 	case "export":
 		cmdExport(cfg)
 	case "import":
@@ -1472,6 +1477,135 @@ func cmdStats(cfg store.Config) {
 	fmt.Printf("  Prompts:      %d\n", stats.TotalPrompts)
 	fmt.Printf("  Projects:     %s\n", projects)
 	fmt.Printf("  Database:     %s/engram.db\n", cfg.DataDir)
+}
+
+// cmdPrune surfaces the review queue — observations past their decay horizon — for
+// triage. It deliberately does NOT delete: pruning stays LLM-judged. The agent (or
+// human) reads the list and runs `engram delete <id>` on the noise, extracting any
+// durable value into a typed note first.
+func cmdPrune(cfg store.Config) {
+	project := ""
+	typeFilter := ""
+	limit := 50
+	asJSON := false
+
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--project":
+			if i+1 < len(os.Args) {
+				project = os.Args[i+1]
+				i++
+			}
+		case "--type":
+			if i+1 < len(os.Args) {
+				typeFilter = os.Args[i+1]
+				i++
+			}
+		case "--limit":
+			if i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					limit = n
+				}
+				i++
+			}
+		case "--json":
+			asJSON = true
+		}
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	obs, err := storePrune(s, project, typeFilter, limit)
+	if err != nil {
+		fatal(err)
+		return
+	}
+
+	if asJSON {
+		type pruneItem struct {
+			ID          int64   `json:"id"`
+			Type        string  `json:"type"`
+			Project     string  `json:"project,omitempty"`
+			Title       string  `json:"title"`
+			CreatedAt   string  `json:"created_at"`
+			ReviewAfter *string `json:"review_after,omitempty"`
+			AgeDays     int     `json:"age_days"`
+		}
+		items := make([]pruneItem, 0, len(obs))
+		for _, o := range obs {
+			p := ""
+			if o.Project != nil {
+				p = *o.Project
+			}
+			items = append(items, pruneItem{
+				ID: o.ID, Type: o.Type, Project: p, Title: o.Title,
+				CreatedAt: o.CreatedAt, ReviewAfter: o.ReviewAfter, AgeDays: ageDays(o.CreatedAt),
+			})
+		}
+		out, err := jsonMarshalIndent(items, "", "  ")
+		if err != nil {
+			fatal(err)
+			return
+		}
+		fmt.Println(string(out))
+		return
+	}
+
+	if len(obs) == 0 {
+		fmt.Println("Nothing past its review horizon. Memory is tidy. ✨")
+		return
+	}
+
+	fmt.Printf("%d observation(s) past their review horizon (oldest first):\n\n", len(obs))
+	order := []string{}
+	byType := map[string][]store.Observation{}
+	for _, o := range obs {
+		if _, ok := byType[o.Type]; !ok {
+			order = append(order, o.Type)
+		}
+		byType[o.Type] = append(byType[o.Type], o)
+	}
+	for _, t := range order {
+		fmt.Printf("[%s]\n", t)
+		for _, o := range byType[t] {
+			p := ""
+			if o.Project != nil {
+				p = *o.Project
+			}
+			fmt.Printf("  #%-5d %-16s %4dd  %s\n", o.ID, truncate(p, 16), ageDays(o.CreatedAt), truncate(o.Title, 72))
+		}
+		fmt.Println()
+	}
+	fmt.Println("Triage each: `engram delete <id>` to prune (soft-delete, recoverable) — extract any durable")
+	fmt.Println("bug-class / invariant into a typed note first. Pinned observations are never listed.")
+}
+
+// ageDays returns whole days since createdAt; 0 if unparseable or in the future.
+func ageDays(createdAt string) int {
+	t, err := parseCmdTime(createdAt)
+	if err != nil {
+		return 0
+	}
+	d := time.Since(t).Hours() / 24
+	if d < 0 {
+		return 0
+	}
+	return int(d)
+}
+
+// parseCmdTime parses the timestamp formats engram stores observations with.
+func parseCmdTime(s string) (time.Time, error) {
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339, "2006-01-02T15:04:05Z07:00"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized time %q", s)
 }
 
 func cmdExport(cfg store.Config) {
@@ -2599,6 +2733,10 @@ Commands:
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
+  prune              List observations past their review horizon for triage
+                       [--project P] [--type T] [--limit N] [--json]
+                       Surfacing only — deletion stays a deliberate 'engram delete <id>' step
+                       so pruning remains judged, not blind-TTL.
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
   projects list      List all projects with observation, session, and prompt counts

@@ -240,18 +240,26 @@ const (
 	SyncSourceRemote = "remote"
 
 	// Decay defaults — months added to now() to compute review_after on new inserts.
-	// expires_at is NULL for all types in Phase 1.
-	decayDecisionMonths   = 6
-	decayPolicyMonths     = 12
-	decayPreferenceMonths = 3
+	// Durable, high-value types (bugfix, pattern, architecture, bug) are intentionally
+	// ABSENT from decayReviewAfterMonths → review_after = NULL → effectively immortal.
+	// Churny, low-durability types get SHORT horizons so they surface for pruning fast.
+	decayDecisionMonths       = 6
+	decayPolicyMonths         = 12
+	decayPreferenceMonths     = 3
+	decaySessionSummaryMonths = 1 // session recaps go stale within weeks
+	decayConfigMonths         = 2 // point-in-time status/state notes
+	decayDiscoveryMonths      = 3 // many are "PXX built / PR merged" records git already holds
 )
 
 // decayReviewAfterMonths maps observation type → month offset for review_after.
 // Types absent from this map get review_after = NULL (Phase 1 behavior).
 var decayReviewAfterMonths = map[string]int{
-	"decision":   decayDecisionMonths,
-	"policy":     decayPolicyMonths,
-	"preference": decayPreferenceMonths,
+	"decision":        decayDecisionMonths,
+	"policy":          decayPolicyMonths,
+	"preference":      decayPreferenceMonths,
+	"session_summary": decaySessionSummaryMonths,
+	"config":          decayConfigMonths,
+	"discovery":       decayDiscoveryMonths,
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
@@ -2549,6 +2557,74 @@ func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observat
 	return s.queryObservations(query, args...)
 }
 
+// decayEligibilityClause builds the SQL predicate (and its bind args) selecting
+// observations due for review under the CURRENT decay policy. It honors a stored
+// review_after when present (so mark_reviewed resets and typed decays are respected)
+// and otherwise falls back to a type-based offset from created_at — so legacy rows
+// that predate a policy change (review_after IS NULL) are still evaluated.
+// decayReviewAfterMonths stays the single source of truth: the per-type CASE is
+// generated from it. Because datetime(created_at, NULL) yields NULL and `NULL <= x`
+// is falsy, types absent from the policy map are naturally excluded from the fallback.
+func decayEligibilityClause() (string, []any) {
+	caseExpr := "CASE o.type"
+	args := []any{}
+	for t, months := range decayReviewAfterMonths {
+		caseExpr += " WHEN ? THEN ?"
+		args = append(args, t, fmt.Sprintf("+%d months", months))
+	}
+	caseExpr += " ELSE NULL END"
+	clause := "((o.review_after IS NOT NULL AND datetime(o.review_after) <= datetime('now'))" +
+		" OR (o.review_after IS NULL AND datetime(o.created_at, (" + caseExpr + ")) <= datetime('now')))"
+	return clause, args
+}
+
+// ObservationsPastDecay returns non-deleted, non-pinned observations due for review
+// under the current decay policy (see decayEligibilityClause), oldest first.
+// An empty project searches all projects; an empty typeFilter matches all types.
+// typeFilter is applied inside the query (before LIMIT) so a type-scoped call is not
+// starved by unrelated types crowding out the oldest-N window.
+func (s *Store) ObservationsPastDecay(project, typeFilter string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+	clause, args := decayEligibilityClause()
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+		  AND o.pinned = 0
+		  AND ` + clause
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if typeFilter != "" {
+		query += " AND o.type = ?"
+		args = append(args, typeFilter)
+	}
+	query += " ORDER BY datetime(o.created_at) ASC, o.id ASC LIMIT ?"
+	args = append(args, limit)
+	return s.queryObservations(query, args...)
+}
+
+// CountObservationsPastReview counts observations due for review under the current
+// decay policy. Cheap enough to call on every context load. Empty project = all projects.
+func (s *Store) CountObservationsPastReview(project string) (int, error) {
+	project, _ = NormalizeProject(project)
+	clause, args := decayEligibilityClause()
+	query := `SELECT COUNT(*) FROM observations o WHERE o.deleted_at IS NULL AND o.pinned = 0 AND ` + clause
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	var n int
+	if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // MarkReviewed resets an observation's review_after using its type's configured decay offset.
 // Types without a decay offset return to a NULL review_after value.
 // This lifecycle reset is intentionally local-only until the sync wire format includes review_after.
@@ -3409,7 +3485,9 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 {
+	reviewCount, _ := s.CountObservationsPastReview(project)
+
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && reviewCount == 0 {
 		return "", nil
 	}
 
@@ -3453,6 +3531,10 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 				obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
 		b.WriteString("\n")
+	}
+
+	if reviewCount > 0 {
+		fmt.Fprintf(&b, "### ⚠️ Memory Maintenance\n%d observation(s) past their review horizon. Run `engram prune` to triage — delete stale/superseded notes (extract any durable value into a typed note first).\n\n", reviewCount)
 	}
 
 	return b.String(), nil
