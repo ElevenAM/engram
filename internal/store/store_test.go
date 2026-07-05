@@ -8694,3 +8694,250 @@ func TestSearchMatchMode_EmptyQueryAnyReturnsError(t *testing.T) {
 		t.Fatal("expected error for empty query with match_mode=any, got nil")
 	}
 }
+
+// ─── Two-tier pruning follow-ups: auto topic chains, immortal audit, nudge gate ───
+
+func TestAutoTopicKeyChainsStatusTypes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-auto", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "discovery", Title: "P34 rollout status",
+		Content: "phase 1 deployed", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	first, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get first: %v", err)
+	}
+	if first.TopicKey == nil || *first.TopicKey == "" {
+		t.Fatal("discovery save without topic_key must get an auto-assigned one")
+	}
+	if first.ReviewAfter == nil {
+		t.Fatal("discovery insert must carry a review_after")
+	}
+	firstReview := *first.ReviewAfter
+
+	secondID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "discovery", Title: "P34 rollout status",
+		Content: "phase 2 deployed, phase 1 verified", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if secondID != firstID {
+		t.Fatalf("same-title discovery must revise the chain, not insert: got new id %d (want %d)", secondID, firstID)
+	}
+	revised, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get revised: %v", err)
+	}
+	if revised.RevisionCount != 2 {
+		t.Fatalf("revision_count = %d, want 2", revised.RevisionCount)
+	}
+	if revised.Content != "phase 2 deployed, phase 1 verified" {
+		t.Fatalf("chain content not replaced: %q", revised.Content)
+	}
+	if revised.ReviewAfter == nil || *revised.ReviewAfter < firstReview {
+		t.Fatalf("revision must restart the review clock: first=%q revised=%v", firstReview, revised.ReviewAfter)
+	}
+
+	// Durable types must NOT auto-chain: identical titles can be distinct facts.
+	bugAID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "bugfix", Title: "Fix flaky test",
+		Content: "auth test raced on token refresh", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("bugfix A: %v", err)
+	}
+	bugA, err := s.GetObservation(bugAID)
+	if err != nil {
+		t.Fatalf("get bugfix A: %v", err)
+	}
+	if bugA.TopicKey != nil && *bugA.TopicKey != "" {
+		t.Fatalf("bugfix must not get an auto topic_key, got %q", *bugA.TopicKey)
+	}
+	bugBID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "bugfix", Title: "Fix flaky test",
+		Content: "search test depended on wall clock", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("bugfix B: %v", err)
+	}
+	if bugBID == bugAID {
+		t.Fatal("identically-titled bugfixes must remain separate rows")
+	}
+}
+
+func TestImmortalObservationsListsNonDecayingTypes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-imm", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	archID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "architecture", Title: "Hexagonal store boundary",
+		Content: "store package stays hermetic", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("architecture save: %v", err)
+	}
+	if err := s.PinObservation(archID); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "bugfix", Title: "Fix NULL review_after fallback",
+		Content: "legacy rows evaluated from created_at", Project: "engram",
+	}); err != nil {
+		t.Fatalf("bugfix save: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "discovery", Title: "CI cache quirk",
+		Content: "decays, must not appear", Project: "engram",
+	}); err != nil {
+		t.Fatalf("discovery save: %v", err)
+	}
+
+	obs, err := s.ImmortalObservations("engram", "", 50)
+	if err != nil {
+		t.Fatalf("ImmortalObservations: %v", err)
+	}
+	types := map[string]bool{}
+	sawPinnedArch := false
+	for _, o := range obs {
+		types[o.Type] = true
+		if o.Type == "architecture" && o.Pinned {
+			sawPinnedArch = true
+		}
+	}
+	if !types["architecture"] || !types["bugfix"] {
+		t.Fatalf("expected architecture+bugfix in immortal audit, got %v", types)
+	}
+	if types["discovery"] {
+		t.Fatal("decaying type 'discovery' must not appear in the immortal audit")
+	}
+	if !sawPinnedArch {
+		t.Fatal("pinned immortal notes must be INCLUDED in the audit (accuracy matters most there)")
+	}
+
+	filtered, err := s.ImmortalObservations("engram", "bugfix", 50)
+	if err != nil {
+		t.Fatalf("ImmortalObservations type filter: %v", err)
+	}
+	for _, o := range filtered {
+		if o.Type != "bugfix" {
+			t.Fatalf("type filter leaked %q", o.Type)
+		}
+	}
+	if len(filtered) == 0 {
+		t.Fatal("type-filtered immortal audit returned nothing")
+	}
+}
+
+func TestSetSessionSummaryStoresOnSessionRow(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-sum", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := s.SetSessionSummary("s-sum", "## Goal\nfirst recap"); err != nil {
+		t.Fatalf("SetSessionSummary: %v", err)
+	}
+	sess, err := s.GetSession("s-sum")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Summary == nil || *sess.Summary != "## Goal\nfirst recap" {
+		t.Fatalf("summary not stored on session row: %v", sess.Summary)
+	}
+	if sess.EndedAt != nil {
+		t.Fatal("SetSessionSummary must not end the session")
+	}
+
+	if err := s.SetSessionSummary("s-sum", "## Goal\nfinal recap"); err != nil {
+		t.Fatalf("second SetSessionSummary: %v", err)
+	}
+	sess, err = s.GetSession("s-sum")
+	if err != nil {
+		t.Fatalf("GetSession after overwrite: %v", err)
+	}
+	if sess.Summary == nil || *sess.Summary != "## Goal\nfinal recap" {
+		t.Fatalf("latest recap must win, got %v", sess.Summary)
+	}
+
+	// No observation may be created by a session summary anymore.
+	obs, err := s.RecentObservations("engram", "", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+	for _, o := range obs {
+		if o.Type == "session_summary" {
+			t.Fatal("session summaries must not be stored as observations")
+		}
+	}
+}
+
+func TestFormatContextMaintenanceNudgeGate(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-gate", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Titles must be unique across calls: same-titled discovery saves would
+	// auto-chain into one row (by design) instead of growing the queue.
+	seq := 0
+	expire := func(n int) {
+		for i := 0; i < n; i++ {
+			seq++
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-gate", Type: "discovery",
+				Title:   fmt.Sprintf("stale status note %d", seq),
+				Content: fmt.Sprintf("stale content %d", seq), Project: "engram",
+			})
+			if err != nil {
+				t.Fatalf("save %d: %v", seq, err)
+			}
+			if _, err := s.db.Exec(`UPDATE observations SET review_after = '2020-01-01 00:00:00' WHERE id = ?`, id); err != nil {
+				t.Fatalf("expire %d: %v", seq, err)
+			}
+		}
+	}
+
+	expire(maintenanceNudgeThreshold) // exactly at threshold — must stay silent
+	out, err := s.FormatContext("engram", "")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if strings.Contains(out, "Memory Maintenance") {
+		t.Fatalf("nudge must be gated at <= %d past-review observations:\n%s", maintenanceNudgeThreshold, out)
+	}
+
+	expire(1) // one over the threshold — nudge appears
+	out, err = s.FormatContext("engram", "")
+	if err != nil {
+		t.Fatalf("FormatContext over threshold: %v", err)
+	}
+	if !strings.Contains(out, "Memory Maintenance") {
+		t.Fatalf("expected maintenance nudge above threshold:\n%s", out)
+	}
+}
+
+func TestDecayEligibilityClauseDeterministic(t *testing.T) {
+	sql1, args1 := decayEligibilityClause()
+	sql2, args2 := decayEligibilityClause()
+	if sql1 != sql2 {
+		t.Fatalf("clause SQL must be deterministic:\n%s\nvs\n%s", sql1, sql2)
+	}
+	if len(args1) != len(args2) {
+		t.Fatalf("arg count mismatch: %d vs %d", len(args1), len(args2))
+	}
+	for i := range args1 {
+		if args1[i] != args2[i] {
+			t.Fatalf("args diverge at %d: %v vs %v", i, args1[i], args2[i])
+		}
+	}
+}

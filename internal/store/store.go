@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -249,6 +250,11 @@ const (
 	decaySessionSummaryMonths = 1 // session recaps go stale within weeks
 	decayConfigMonths         = 2 // point-in-time status/state notes
 	decayDiscoveryMonths      = 3 // many are "PXX built / PR merged" records git already holds
+
+	// maintenanceNudgeThreshold gates the context-load maintenance nudge: it
+	// appears only when MORE than this many observations are past review, so a
+	// trickle of expiries doesn't nag every session.
+	maintenanceNudgeThreshold = 5
 )
 
 // decayReviewAfterMonths maps observation type → month offset for review_after.
@@ -260,6 +266,28 @@ var decayReviewAfterMonths = map[string]int{
 	"session_summary": decaySessionSummaryMonths,
 	"config":          decayConfigMonths,
 	"discovery":       decayDiscoveryMonths,
+}
+
+// decayPolicyTypes returns the decay map's keys in sorted order, so SQL built
+// from the policy is deterministic across calls (map iteration order is not).
+func decayPolicyTypes() []string {
+	types := make([]string, 0, len(decayReviewAfterMonths))
+	for t := range decayReviewAfterMonths {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+	return types
+}
+
+// autoTopicKeyTypes are status-chain-prone types that get an automatic
+// topic_key (derived from type+title) when the caller supplies none, so
+// repeated saves about the same subject revise one chain instead of
+// accumulating near-duplicate rows. Durable types are deliberately excluded:
+// two identically-titled bugfix/architecture notes may be distinct facts, and
+// a wrong merge silently replaces content.
+var autoTopicKeyTypes = map[string]bool{
+	"config":    true,
+	"discovery": true,
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
@@ -2075,6 +2103,49 @@ func (s *Store) EndSession(id string, summary string) error {
 	})
 }
 
+// SetSessionSummary stores or replaces a session's summary without ending the
+// session. Summaries live on the session row — NOT as recallable observations —
+// so recaps surface in recent context but never enter the search pool or the
+// decay/prune queue. Durable facts belong in typed observations (AddObservation).
+// A later call (e.g. the end-of-session summary after a mid-session compaction
+// recap) overwrites the previous one: latest recap wins.
+func (s *Store) SetSessionSummary(id, summary string) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		res, err := s.execHook(tx,
+			`UPDATE sessions SET summary = ? WHERE id = ?`,
+			nullableString(summary), id,
+		)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return nil
+		}
+
+		var startedAt, project, directory string
+		var endedAt, storedSummary *string
+		if err := tx.QueryRow(
+			`SELECT project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
+			id,
+		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
+			return err
+		}
+
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
+			ID:        id,
+			Project:   project,
+			Directory: directory,
+			StartedAt: startedAt,
+			EndedAt:   endedAt,
+			Summary:   storedSummary,
+		})
+	})
+}
+
 func (s *Store) GetSession(id string) (*Session, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
@@ -2272,6 +2343,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
+	if topicKey == "" && autoTopicKeyTypes[p.Type] {
+		topicKey = normalizeTopicKey(SuggestTopicKey(p.Type, title, content))
+	}
 
 	var observationID int64
 	var dupBump bool // true when the save was a pure duplicate_count bump (content unchanged)
@@ -2290,6 +2364,13 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				topicKey, nullableString(p.Project), scope,
 			).Scan(&existingID)
 			if err == nil {
+				// A revision restarts the review clock: the chain's content is
+				// fresh again, so it must not surface in the prune queue on the
+				// original insert's schedule (NULL when the type has no decay).
+				var reviewAfter any
+				if months, ok := decayReviewAfterMonths[p.Type]; ok {
+					reviewAfter = time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+				}
 				if _, err := s.execHook(tx,
 					`UPDATE observations
 					 SET type = ?,
@@ -2298,6 +2379,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					     tool_name = ?,
 					     topic_key = ?,
 					     normalized_hash = ?,
+					     review_after = ?,
 					     revision_count = revision_count + 1,
 					     last_seen_at = datetime('now'),
 					     updated_at = datetime('now')
@@ -2308,6 +2390,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					nullableString(p.ToolName),
 					nullableString(topicKey),
 					normHash,
+					reviewAfter,
 					existingID,
 				); err != nil {
 					return err
@@ -2568,9 +2651,9 @@ func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observat
 func decayEligibilityClause() (string, []any) {
 	caseExpr := "CASE o.type"
 	args := []any{}
-	for t, months := range decayReviewAfterMonths {
+	for _, t := range decayPolicyTypes() {
 		caseExpr += " WHEN ? THEN ?"
-		args = append(args, t, fmt.Sprintf("+%d months", months))
+		args = append(args, t, fmt.Sprintf("+%d months", decayReviewAfterMonths[t]))
 	}
 	caseExpr += " ELSE NULL END"
 	clause := "((o.review_after IS NOT NULL AND datetime(o.review_after) <= datetime('now'))" +
@@ -2623,6 +2706,44 @@ func (s *Store) CountObservationsPastReview(project string) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ImmortalObservations returns non-deleted observations whose type has no decay
+// horizon (absent from decayReviewAfterMonths) — the rows the normal prune queue
+// never surfaces. Used by `engram prune --immortal` as the safety net for
+// immortal types: when the architecture materially changes (e.g. at a production
+// push), these notes must be re-read and updated to match, because nothing else
+// will ever flag them. Pinned rows are INCLUDED — accuracy matters most there.
+// Ordered least-recently-updated first: the longest-untouched notes are the
+// likeliest to be stale.
+func (s *Store) ImmortalObservations(project, typeFilter string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+	types := decayPolicyTypes()
+	placeholders := make([]string, len(types))
+	args := make([]any, 0, len(types)+3)
+	for i, t := range types {
+		placeholders[i] = "?"
+		args = append(args, t)
+	}
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+		  AND o.type NOT IN (` + strings.Join(placeholders, ", ") + `)`
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if typeFilter != "" {
+		query += " AND o.type = ?"
+		args = append(args, typeFilter)
+	}
+	query += " ORDER BY datetime(o.updated_at) ASC, o.id ASC LIMIT ?"
+	args = append(args, limit)
+	return s.queryObservations(query, args...)
 }
 
 // MarkReviewed resets an observation's review_after using its type's configured decay offset.
@@ -3486,8 +3607,12 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	}
 
 	reviewCount, _ := s.CountObservationsPastReview(project)
+	// Gate the maintenance nudge: a small backlog on every context load is
+	// itself noise. Only nag once the queue is meaningfully backed up, which
+	// also batches triage into fewer, larger passes.
+	showMaintenance := reviewCount > maintenanceNudgeThreshold
 
-	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && reviewCount == 0 {
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && !showMaintenance {
 		return "", nil
 	}
 
@@ -3496,10 +3621,19 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 
 	if len(sessions) > 0 {
 		b.WriteString("### Recent Sessions\n")
+		// Summaries live on the session row (not as observations), so this list
+		// is the primary recap channel: render the most recent summarized
+		// session at depth, older ones as one-liners.
+		fullSummaryShown := false
 		for _, sess := range sessions {
 			summary := ""
 			if sess.Summary != nil {
-				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, 200))
+				limit := 200
+				if !fullSummaryShown {
+					limit = 800
+					fullSummaryShown = true
+				}
+				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, limit))
 			}
 			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
 				sess.Project, timeutil.FormatLocal(sess.StartedAt), summary, sess.ObservationCount)
@@ -3533,8 +3667,8 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("\n")
 	}
 
-	if reviewCount > 0 {
-		fmt.Fprintf(&b, "### ⚠️ Memory Maintenance\n%d observation(s) past their review horizon. Run `engram prune` to triage — delete stale/superseded notes (extract any durable value into a typed note first).\n\n", reviewCount)
+	if showMaintenance {
+		fmt.Fprintf(&b, "### ⚠️ Memory Maintenance\n%d observations past their review horizon. Run `engram prune` to triage — delete stale/superseded notes (extract any durable value into a typed note first).\n\n", reviewCount)
 	}
 
 	return b.String(), nil

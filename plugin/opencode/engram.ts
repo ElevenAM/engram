@@ -89,7 +89,8 @@ Also search memory PROACTIVELY when:
 ### SESSION CLOSE PROTOCOL (mandatory)
 
 Before ending a session or saying "done" / "that's it", you MUST:
-1. Call \`mem_session_summary\` with this structure:
+1. Save any still-unsaved durable facts (decisions, gotchas, patterns, bugs) via \`mem_save\` — the summary is session metadata shown in recent context, NOT searchable memory
+2. Call \`mem_session_summary\` with this structure:
 
 ## Goal
 [What we were working on this session]
@@ -110,6 +111,14 @@ Before ending a session or saying "done" / "that's it", you MUST:
 - path/to/file — [what it does or what changed]
 
 This is NOT optional. If you skip this, the next session starts blind.
+
+### PRODUCTION PUSH — IMMORTAL-NOTE AUDIT
+
+Immortal types (architecture, pattern, bugfix, bug) never decay, so nothing ever flags them for review. A production push locks in the current approach — that is the moment to re-verify them:
+
+1. Before pushing/merging to the production (deploy) branch, ask: did this session or branch materially change the architecture or approach?
+2. If yes: run \`engram prune --immortal --project <project>\` and re-read the notes touching the changed area.
+3. Update stale notes to match the new reality (\`mem_update\`), or delete truly obsolete ones (\`engram delete <id>\`). Never leave an immortal note describing a dead approach.
 
 ### AFTER COMPACTION
 

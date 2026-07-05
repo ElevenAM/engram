@@ -171,7 +171,13 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - User's FIRST message references the project, a feature, or a problem — call `mem_search` with keywords from their message to check for prior work before responding
 
 ### SESSION CLOSE — before saying "done":
-Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+1. `mem_save` any still-unsaved durable facts FIRST — the summary is session metadata (shown in recent context), NOT searchable memory
+2. Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+
+### PRODUCTION PUSH — immortal-note audit
+Immortal types (architecture, pattern, bugfix, bug) never decay; nothing ever flags them for review. A production push locks in the approach — re-verify them then:
+- Before pushing/merging to the production (deploy) branch, if this session or branch materially changed architecture or approach: run `engram prune --immortal --project <project>` and re-read notes touching the changed area.
+- Update stale notes (`mem_update`) to match the new reality, or delete truly obsolete ones (`engram delete <id>`). Never leave an immortal note describing a dead approach.
 PROTOCOL
 
 # Inject memory context if available

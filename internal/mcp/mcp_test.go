@@ -5661,6 +5661,23 @@ func TestMemSaveSchemaIncludesCapturePrompt(t *testing.T) {
 	}
 }
 
+// sessionSummaryFor returns the stored summary of the project's most recent
+// summarized session. Summaries live on the session row (not as observations),
+// so this is how tests assert mem_session_summary persisted anything.
+func sessionSummaryFor(t *testing.T, s *store.Store, project string) string {
+	t.Helper()
+	sessions, err := s.RecentSessions(project, 10)
+	if err != nil {
+		t.Fatalf("RecentSessions(%q): %v", project, err)
+	}
+	for _, sess := range sessions {
+		if sess.Summary != nil && *sess.Summary != "" {
+			return *sess.Summary
+		}
+	}
+	return ""
+}
+
 // TestMemSessionSummary_AutoDetectsProject: summary is stored under the auto-detected project.
 func TestMemSessionSummary_AutoDetectsProject(t *testing.T) {
 	dir := t.TempDir()
@@ -5684,9 +5701,8 @@ func TestMemSessionSummary_AutoDetectsProject(t *testing.T) {
 		t.Fatalf("session summary: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("summary-auto-project", "project", 5)
-	if err != nil || len(obs) == 0 {
-		t.Fatal("expected session_summary observation under auto-detected project 'summary-auto-project'")
+	if got := sessionSummaryFor(t, s, "summary-auto-project"); !strings.Contains(got, "Test auto-detection") {
+		t.Fatalf("expected session summary stored under auto-detected project 'summary-auto-project'; got %q", got)
 	}
 
 	m := callResultJSON(t, res)
@@ -6996,12 +7012,8 @@ func TestSessionSummary_ProcessOverrideWritesToDefaultProject(t *testing.T) {
 		t.Fatalf("session summary error: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("trusted project", "project", 5)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	if len(obs) == 0 {
-		t.Fatal("expected session_summary observation under 'trusted project' (process override); got none")
+	if got := sessionSummaryFor(t, s, "trusted project"); !strings.Contains(got, "Process override session summary") {
+		t.Fatalf("expected session summary under 'trusted project' (process override); got %q", got)
 	}
 
 	m := callResultJSON(t, res)
@@ -7037,12 +7049,8 @@ func TestSessionSummary_ProcessOverrideBypassesAmbiguousCWD(t *testing.T) {
 		t.Fatalf("expected success via process override; err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("override-project", "project", 5)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	if len(obs) == 0 {
-		t.Fatal("expected session_summary under 'override-project'; got none")
+	if got := sessionSummaryFor(t, s, "override-project"); !strings.Contains(got, "Ambiguous override test") {
+		t.Fatalf("expected session summary under 'override-project'; got %q", got)
 	}
 }
 

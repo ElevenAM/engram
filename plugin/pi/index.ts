@@ -78,10 +78,18 @@ call \`mem_search\`, then \`mem_get_observation\` for full content.
 
 ### SESSION CLOSE PROTOCOL
 
-Before ending a session or saying "done", call \`mem_session_summary\`
+Before ending a session or saying "done", first \`mem_save\` any still-unsaved durable
+facts (the summary is session metadata, not searchable memory), then call \`mem_session_summary\`
 with Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
 If \`mem_session_summary\` fails because Engram cannot detect a project, ask the user
 which project should receive the summary, then retry with \`project: "<name>"\`.
+
+### PRODUCTION PUSH — IMMORTAL-NOTE AUDIT
+
+Immortal types (architecture, pattern, bugfix, bug) never decay. Before pushing to the
+production branch after a material architecture change, run \`engram prune --immortal
+--project <project>\` and update notes that no longer match reality (\`mem_update\`),
+or delete truly obsolete ones (\`engram delete <id>\`).
 
 ### AFTER COMPACTION
 

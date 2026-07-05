@@ -118,6 +118,9 @@ var (
 	storePrune         = func(s *store.Store, project, typeFilter string, limit int) ([]store.Observation, error) {
 		return s.ObservationsPastDecay(project, typeFilter, limit)
 	}
+	storeImmortalAudit = func(s *store.Store, project, typeFilter string, limit int) ([]store.Observation, error) {
+		return s.ImmortalObservations(project, typeFilter, limit)
+	}
 	storeExport       = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent = json.MarshalIndent
 	runDiagnostics    = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
@@ -1483,11 +1486,18 @@ func cmdStats(cfg store.Config) {
 // triage. It deliberately does NOT delete: pruning stays LLM-judged. The agent (or
 // human) reads the list and runs `engram delete <id>` on the noise, extracting any
 // durable value into a typed note first.
+//
+// --immortal flips the lens: instead of the decay queue it lists observations of
+// types with NO decay horizon (architecture/pattern/bugfix/bug/…). These never
+// surface on their own, so this audit is their only safety net — run it when the
+// architecture materially changes (e.g. before a production push) and update
+// notes that no longer match reality.
 func cmdPrune(cfg store.Config) {
 	project := ""
 	typeFilter := ""
 	limit := 50
 	asJSON := false
+	immortal := false
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -1510,6 +1520,8 @@ func cmdPrune(cfg store.Config) {
 			}
 		case "--json":
 			asJSON = true
+		case "--immortal":
+			immortal = true
 		}
 	}
 
@@ -1520,7 +1532,12 @@ func cmdPrune(cfg store.Config) {
 	}
 	defer s.Close()
 
-	obs, err := storePrune(s, project, typeFilter, limit)
+	var obs []store.Observation
+	if immortal {
+		obs, err = storeImmortalAudit(s, project, typeFilter, limit)
+	} else {
+		obs, err = storePrune(s, project, typeFilter, limit)
+	}
 	if err != nil {
 		fatal(err)
 		return
@@ -1533,8 +1550,10 @@ func cmdPrune(cfg store.Config) {
 			Project     string  `json:"project,omitempty"`
 			Title       string  `json:"title"`
 			CreatedAt   string  `json:"created_at"`
+			UpdatedAt   string  `json:"updated_at,omitempty"`
 			ReviewAfter *string `json:"review_after,omitempty"`
 			AgeDays     int     `json:"age_days"`
+			Pinned      bool    `json:"pinned,omitempty"`
 		}
 		items := make([]pruneItem, 0, len(obs))
 		for _, o := range obs {
@@ -1544,7 +1563,8 @@ func cmdPrune(cfg store.Config) {
 			}
 			items = append(items, pruneItem{
 				ID: o.ID, Type: o.Type, Project: p, Title: o.Title,
-				CreatedAt: o.CreatedAt, ReviewAfter: o.ReviewAfter, AgeDays: ageDays(o.CreatedAt),
+				CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt, ReviewAfter: o.ReviewAfter,
+				AgeDays: ageDays(o.CreatedAt), Pinned: o.Pinned,
 			})
 		}
 		out, err := jsonMarshalIndent(items, "", "  ")
@@ -1557,11 +1577,19 @@ func cmdPrune(cfg store.Config) {
 	}
 
 	if len(obs) == 0 {
-		fmt.Println("Nothing past its review horizon. Memory is tidy. ✨")
+		if immortal {
+			fmt.Println("No immortal-type observations found.")
+		} else {
+			fmt.Println("Nothing past its review horizon. Memory is tidy. ✨")
+		}
 		return
 	}
 
-	fmt.Printf("%d observation(s) past their review horizon (oldest first):\n\n", len(obs))
+	if immortal {
+		fmt.Printf("%d immortal-type observation(s) — least-recently-updated first:\n\n", len(obs))
+	} else {
+		fmt.Printf("%d observation(s) past their review horizon (oldest first):\n\n", len(obs))
+	}
 	order := []string{}
 	byType := map[string][]store.Observation{}
 	for _, o := range obs {
@@ -1577,12 +1605,22 @@ func cmdPrune(cfg store.Config) {
 			if o.Project != nil {
 				p = *o.Project
 			}
-			fmt.Printf("  #%-5d %-16s %4dd  %s\n", o.ID, truncate(p, 16), ageDays(o.CreatedAt), truncate(o.Title, 72))
+			pin := "  "
+			if o.Pinned {
+				pin = "📌"
+			}
+			fmt.Printf("  #%-5d %s %-16s %4dd  %s\n", o.ID, pin, truncate(p, 16), ageDays(o.CreatedAt), truncate(o.Title, 72))
 		}
 		fmt.Println()
 	}
-	fmt.Println("Triage each: `engram delete <id>` to prune (soft-delete, recoverable) — extract any durable")
-	fmt.Println("bug-class / invariant into a typed note first. Pinned observations are never listed.")
+	if immortal {
+		fmt.Println("These types never decay — this audit is their only review. Re-read each note that touches")
+		fmt.Println("the changed area and update it (MCP mem_update) to match the current architecture; delete")
+		fmt.Println("(`engram delete <id>`) only if truly obsolete. Never leave a note describing a dead approach.")
+	} else {
+		fmt.Println("Triage each: `engram delete <id>` to prune (soft-delete, recoverable) — extract any durable")
+		fmt.Println("bug-class / invariant into a typed note first. Pinned observations are never listed.")
+	}
 }
 
 // ageDays returns whole days since createdAt; 0 if unparseable or in the future.
@@ -2734,9 +2772,12 @@ Commands:
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
   prune              List observations past their review horizon for triage
-                       [--project P] [--type T] [--limit N] [--json]
+                       [--project P] [--type T] [--limit N] [--json] [--immortal]
                        Surfacing only — deletion stays a deliberate 'engram delete <id>' step
                        so pruning remains judged, not blind-TTL.
+                       --immortal lists never-decaying types (architecture/pattern/bugfix/bug)
+                       instead: run after material architecture changes (e.g. before a
+                       production push) and update notes that no longer match reality.
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
   projects list      List all projects with observation, session, and prompt counts

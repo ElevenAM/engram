@@ -636,7 +636,7 @@ Examples:
 				mcp.WithDestructiveHintAnnotation(false),
 				mcp.WithIdempotentHintAnnotation(false),
 				mcp.WithOpenWorldHintAnnotation(false),
-				mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. This creates a structured summary that future sessions will use to understand what happened.
+				mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. The summary is stored on the session record and shown in recent context — it is NOT a searchable observation and will not surface in mem_search. Save durable facts (decisions, gotchas, patterns, bugs) as typed observations via mem_save FIRST, then write this recap. Calling it again in the same session replaces the previous summary (latest recap wins).
 
 FORMAT — use this exact structure in the content field:
 
@@ -1310,7 +1310,16 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		}
 
 		msg := fmt.Sprintf("Memory saved: %q (%s)", title, typ)
-		if topicKey == "" && suggestedTopicKey != "" {
+		// Report what actually happened to the row: config/discovery saves get an
+		// auto topic_key in the store, so a repeat save REVISES the existing chain
+		// (replacing its content) rather than inserting — the agent must see that.
+		if saved, err := s.GetObservation(savedID); err == nil && saved.TopicKey != nil && *saved.TopicKey != "" {
+			if saved.RevisionCount > 1 {
+				msg = fmt.Sprintf("Memory saved: %q (%s) — revised topic chain %q (revision %d; previous content replaced)", title, typ, *saved.TopicKey, saved.RevisionCount)
+			} else if topicKey == "" {
+				msg += fmt.Sprintf("\ntopic_key %q auto-assigned: future saves with this title will revise this row instead of piling up", *saved.TopicKey)
+			}
+		} else if topicKey == "" && suggestedTopicKey != "" {
 			msg += fmt.Sprintf("\nSuggested topic_key: %s", suggestedTopicKey)
 		}
 		if truncated {
@@ -1908,18 +1917,15 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		// Ensure the implicit MCP session exists with the current working directory.
 		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
-		_, err = s.AddObservation(store.AddObservationParams{
-			SessionID: sessionID,
-			Type:      "session_summary",
-			Title:     fmt.Sprintf("Session summary: %s", project),
-			Content:   content,
-			Project:   project,
-		})
-		if err != nil {
+		// Summaries are session METADATA, not recallable observations: they
+		// render in recent context but never enter the search pool or the
+		// decay/prune queue (as observations they were the top noise source).
+		// Durable facts must already be typed observations via mem_save.
+		if err := s.SetSessionSummary(sessionID, content); err != nil {
 			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
 		}
 
-		msg := fmt.Sprintf("Session summary saved for project %q", project)
+		msg := fmt.Sprintf("Session summary saved for project %q (stored on the session record, shown in recent context — not searchable memory; durable facts belong in mem_save observations)", project)
 		if score := activity.ActivityScore(defaultSessionID(project)); score != "" {
 			msg += "\n" + score
 		}
