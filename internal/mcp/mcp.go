@@ -190,6 +190,15 @@ DEFERRED TOOLS (use ToolSearch when needed):
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.
 
+## COMPACT-SAFE / SAVE-THEN-FORGET
+
+After every successful mem_save, the envelope includes compact_safe=true and pointer (engram:obs/<id>).
+That fact is durable: drop the investigative trail from working context; keep the pointer.
+Rehydrate with mem_get_observation when full detail is needed again.
+Before compaction or session close: mem_save any remaining durable facts FIRST, then write a pointer-first mem_session_summary
+(## Durable Coverage with engram:obs/<id> lines — do not restate full content of compact_safe items).
+mem_context lists "Durable this session" coverage for recovery after compaction.
+
 ## CONFLICT SURFACING — when mem_save returns candidates
 
 After every mem_save call, check the response envelope for judgment_required.
@@ -315,6 +324,11 @@ WHEN to save (call this after each of these):
 - Configuration changes or environment setup
 - Important discoveries or gotchas
 - File structure changes
+
+AFTER SAVE (compact-safe certificate):
+Successful saves return envelope fields compact_safe=true, id, pointer (engram:obs/<id>).
+The fact is durable — drop the investigative trail from working context; keep the pointer.
+Rehydrate later with mem_get_observation(id). Do not restate full compact_safe content in mem_session_summary; list the pointer under ## Durable Coverage.
 
 FORMAT for content — use this structured format:
   **What**: [concise description of what was done]
@@ -542,7 +556,7 @@ Examples:
 	if shouldRegister("mem_context", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_context",
-				mcp.WithDescription("Get recent memory context from previous sessions. Shows recent sessions and observations to understand what was done before."),
+				mcp.WithDescription("Get recent memory context from previous sessions. Includes Durable this session (compact-safe engram:obs/<id> pointers), pinned and recent observations with pointers, session recaps, and prompts. After compaction, call this to recover pointer coverage — rehydrate full content with mem_get_observation."),
 				mcp.WithTitleAnnotation("Get Memory Context"),
 				mcp.WithReadOnlyHintAnnotation(true),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -636,9 +650,13 @@ Examples:
 				mcp.WithDestructiveHintAnnotation(false),
 				mcp.WithIdempotentHintAnnotation(false),
 				mcp.WithOpenWorldHintAnnotation(false),
-				mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. This creates a structured summary that future sessions will use to understand what happened.
+				mcp.WithDescription(`Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. The summary is stored on the session record and shown in recent context — it is NOT a searchable observation and will not surface in mem_search. Save durable facts (decisions, gotchas, patterns, bugs) as typed observations via mem_save FIRST, then write this recap. Calling it again in the same session replaces the previous summary (latest recap wins).
 
 FORMAT — use this exact structure in the content field:
+
+## Durable Coverage
+- engram:obs/<id> — [short title of compact_safe save]
+(List pointers only for facts already saved via mem_save. Do NOT restate their full content.)
 
 ## Goal
 [One sentence: what were we building/working on in this session]
@@ -647,12 +665,11 @@ FORMAT — use this exact structure in the content field:
 [User preferences, constraints, or context discovered during this session. Things a future agent needs to know about HOW the user wants things done. Skip if nothing notable.]
 
 ## Discoveries
-- [Technical finding, gotcha, or learning 1]
-- [Technical finding 2]
+- [Technical finding, gotcha, or learning 1 — only items NOT already under Durable Coverage]
 - [Important API behavior, config quirk, etc.]
 
 ## Accomplished
-- ✅ [Completed task 1 — with key implementation details]
+- ✅ [Completed task 1 — with key implementation details; prefer pointers for saved facts]
 - ✅ [Completed task 2 — mention files changed]
 - 🔲 [Identified but not yet done — for next session]
 
@@ -667,7 +684,7 @@ GUIDELINES:
 - Be CONCISE but don't lose important details (file paths, error messages, decisions)
 - Focus on WHAT and WHY, not HOW (the code itself is in the repo)
 - Include things that would save a future agent time
-- The Discoveries section is the most valuable — capture gotchas and non-obvious learnings
+- The Discoveries section is the most valuable for UNSAVED working state — durable facts belong in mem_save + Durable Coverage pointers
 - Relevant Files should only include files that were significantly changed or are important for context`),
 				mcp.WithString("content",
 					mcp.Required(),
@@ -1018,7 +1035,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
 
-		results, err := s.Search(query, store.SearchOptions{
+		results, searchInfo, err := s.SearchWithInfo(query, store.SearchOptions{
 			Type:      typ,
 			Project:   searchProject,
 			Scope:     scope,
@@ -1027,12 +1044,21 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			Mode:      mode,
 		})
 		if err != nil {
+			// Configuration/mode errors carry their own actionable guidance;
+			// the keyword hint only applies to FTS query-shaped errors.
+			if strings.Contains(err.Error(), "requires embeddings") || strings.Contains(err.Error(), "invalid mode") {
+				return mcp.NewToolResultError(fmt.Sprintf("Search error: %s", err)), nil
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
 		}
 
 		if len(results) == 0 {
 			// JW4: use respondWithProject even for empty results.
-			return respondWithProject(detRes, fmt.Sprintf("No memories found for: %q", query), nil), nil
+			msg := fmt.Sprintf("No memories found for: %q", query)
+			if searchInfo.Degraded {
+				msg += fmt.Sprintf("\n\nNote: semantic ranking was unavailable (%s) — this was a keyword-only search, so a memory phrased differently may still exist. Retry once the embedding backend is back.", searchInfo.DegradedReason)
+			}
+			return respondWithProject(detRes, msg, nil), nil
 		}
 
 		// Batch-load relations for all results (REQ-002). Avoids N+1.
@@ -1051,7 +1077,11 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+		if searchInfo.Degraded {
+			fmt.Fprintf(&b, "Found %d memories (mode: %s — semantic ranking unavailable: %s):\n\n", len(results), searchInfo.Mode, searchInfo.DegradedReason)
+		} else {
+			fmt.Fprintf(&b, "Found %d memories (mode: %s):\n\n", len(results), searchInfo.Mode)
+		}
 		anyTruncated := false
 		structuredResults := make([]map[string]any, 0, len(results))
 		for i, r := range results {
@@ -1145,7 +1175,12 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 
 		// JW4: use respondWithProject for the success path (REQ-314).
-		return respondWithProject(detRes, b.String(), map[string]any{"results": structuredResults}), nil
+		structured := map[string]any{"results": structuredResults, "search_mode": searchInfo.Mode}
+		if searchInfo.Degraded {
+			structured["degraded"] = true
+			structured["degraded_reason"] = searchInfo.DegradedReason
+		}
+		return respondWithProject(detRes, b.String(), structured), nil
 	}
 }
 
@@ -1292,7 +1327,16 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		}
 
 		msg := fmt.Sprintf("Memory saved: %q (%s)", title, typ)
-		if topicKey == "" && suggestedTopicKey != "" {
+		// Report what actually happened to the row: config/discovery saves get an
+		// auto topic_key in the store, so a repeat save REVISES the existing chain
+		// (replacing its content) rather than inserting — the agent must see that.
+		if saved, err := s.GetObservation(savedID); err == nil && saved.TopicKey != nil && *saved.TopicKey != "" {
+			if saved.RevisionCount > 1 {
+				msg = fmt.Sprintf("Memory saved: %q (%s) — revised topic chain %q (revision %d; previous content replaced)", title, typ, *saved.TopicKey, saved.RevisionCount)
+			} else if topicKey == "" {
+				msg += fmt.Sprintf("\ntopic_key %q auto-assigned: future saves with this title will revise this row instead of piling up", *saved.TopicKey)
+			}
+		} else if topicKey == "" && suggestedTopicKey != "" {
 			msg += fmt.Sprintf("\nSuggested topic_key: %s", suggestedTopicKey)
 		}
 		if truncated {
@@ -1324,16 +1368,31 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
 		}
 
-		// Fetch the saved observation's sync_id for the envelope (REQ-001).
-		var savedSyncID string
+		// compact_safe certificate is tied to the successful write (savedID),
+		// not to a successful reload. Agents key off these fields to drop
+		// investigative trails; omitting them on a reload blip would be a
+		// silent half-success.
+		extra["id"] = savedID
+		extra["compact_safe"] = true
+		extra["pointer"] = store.ObservationPointer(savedID)
+		msg += fmt.Sprintf(
+			"\ncompact_safe: durable at %s. Drop investigative trail from working context; rehydrate with mem_get_observation if needed.",
+			store.ObservationPointer(savedID),
+		)
+		// Best-effort enrichment from the reloaded row (sync_id, title, state…).
 		if obs, obsErr := s.GetObservation(savedID); obsErr == nil {
-			savedSyncID = obs.SyncID
-			extra["id"] = savedID
-			extra["sync_id"] = savedSyncID
+			extra["sync_id"] = obs.SyncID
 			extra["state"] = obs.State()
+			extra["title"] = obs.Title
+			extra["type"] = obs.Type
+			if obs.TopicKey != nil && strings.TrimSpace(*obs.TopicKey) != "" {
+				extra["topic_key"] = *obs.TopicKey
+			}
 			if obs.ReviewAfter != nil {
 				extra["review_after"] = *obs.ReviewAfter
 			}
+		} else {
+			fmt.Fprintf(os.Stderr, "engram: GetObservation after save id=%d (non-fatal): %v\n", savedID, obsErr)
 		}
 
 		if len(candidates) > 0 {
@@ -1890,18 +1949,15 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		// Ensure the implicit MCP session exists with the current working directory.
 		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
-		_, err = s.AddObservation(store.AddObservationParams{
-			SessionID: sessionID,
-			Type:      "session_summary",
-			Title:     fmt.Sprintf("Session summary: %s", project),
-			Content:   content,
-			Project:   project,
-		})
-		if err != nil {
+		// Summaries are session METADATA, not recallable observations: they
+		// render in recent context but never enter the search pool or the
+		// decay/prune queue (as observations they were the top noise source).
+		// Durable facts must already be typed observations via mem_save.
+		if err := s.SetSessionSummary(sessionID, content); err != nil {
 			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
 		}
 
-		msg := fmt.Sprintf("Session summary saved for project %q", project)
+		msg := fmt.Sprintf("Session summary saved for project %q (stored on the session record, shown in recent context — not searchable memory; durable facts belong in mem_save observations)", project)
 		if score := activity.ActivityScore(defaultSessionID(project)); score != "" {
 			msg += "\n" + score
 		}

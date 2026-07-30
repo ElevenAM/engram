@@ -45,13 +45,20 @@ Use stable `topic_key` for evolving topics.
 
 ---
 
+## Compact-safe / save-then-forget
+
+After successful `mem_save`, envelope has `compact_safe: true` and `pointer` (`engram:obs/<id>`):
+- Drop investigative trail from working context; keep the pointer
+- Rehydrate with `mem_get_observation`
+- Do not restate full compact_safe bodies in session summaries
+
 ## Session Close Rules
 
 Before saying done/listo:
-1. Call `mem_session_summary`.
-2. Include goal, discoveries, accomplished, next steps, relevant files.
+1. `mem_save` remaining durable facts first
+2. Call `mem_session_summary` with Durable Coverage (pointers), goal, discoveries, accomplished, next steps, relevant files
 
 After compaction:
-1. Save summary first.
-2. Recover context.
-3. Continue work.
+1. `mem_save` durable facts that are not yet pointers
+2. Pointer-first `mem_session_summary`
+3. `mem_context` (Durable this session) then continue

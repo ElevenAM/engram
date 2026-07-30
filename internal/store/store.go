@@ -17,11 +17,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/embed"
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
@@ -241,18 +241,53 @@ const (
 	SyncSourceRemote = "remote"
 
 	// Decay defaults — months added to now() to compute review_after on new inserts.
-	// expires_at is NULL for all types in Phase 1.
-	decayDecisionMonths   = 6
-	decayPolicyMonths     = 12
-	decayPreferenceMonths = 3
+	// Durable, high-value types (bugfix, pattern, architecture, bug) are intentionally
+	// ABSENT from decayReviewAfterMonths → review_after = NULL → effectively immortal.
+	// Churny, low-durability types get SHORT horizons so they surface for pruning fast.
+	decayDecisionMonths       = 6
+	decayPolicyMonths         = 12
+	decayPreferenceMonths     = 3
+	decaySessionSummaryMonths = 1 // session recaps go stale within weeks
+	decayConfigMonths         = 2 // point-in-time status/state notes
+	decayDiscoveryMonths      = 3 // many are "PXX built / PR merged" records git already holds
+
+	// maintenanceNudgeThreshold gates the context-load maintenance nudge: it
+	// appears only when MORE than this many observations are past review, so a
+	// trickle of expiries doesn't nag every session.
+	maintenanceNudgeThreshold = 5
 )
 
 // decayReviewAfterMonths maps observation type → month offset for review_after.
 // Types absent from this map get review_after = NULL (Phase 1 behavior).
 var decayReviewAfterMonths = map[string]int{
-	"decision":   decayDecisionMonths,
-	"policy":     decayPolicyMonths,
-	"preference": decayPreferenceMonths,
+	"decision":        decayDecisionMonths,
+	"policy":          decayPolicyMonths,
+	"preference":      decayPreferenceMonths,
+	"session_summary": decaySessionSummaryMonths,
+	"config":          decayConfigMonths,
+	"discovery":       decayDiscoveryMonths,
+}
+
+// decayPolicyTypes returns the decay map's keys in sorted order, so SQL built
+// from the policy is deterministic across calls (map iteration order is not).
+func decayPolicyTypes() []string {
+	types := make([]string, 0, len(decayReviewAfterMonths))
+	for t := range decayReviewAfterMonths {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+	return types
+}
+
+// autoTopicKeyTypes are status-chain-prone types that get an automatic
+// topic_key (derived from type+title) when the caller supplies none, so
+// repeated saves about the same subject revise one chain instead of
+// accumulating near-duplicate rows. Durable types are deliberately excluded:
+// two identically-titled bugfix/architecture notes may be distinct facts, and
+// a wrong merge silently replaces content.
+var autoTopicKeyTypes = map[string]bool{
+	"config":    true,
+	"discovery": true,
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
@@ -646,10 +681,6 @@ func New(cfg Config) (*Store, error) {
 	}
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
-	}
-
-	if c := embed.FromEnv(); c != nil {
-		s.embedder = c
 	}
 
 	return s, nil
@@ -2072,6 +2103,49 @@ func (s *Store) EndSession(id string, summary string) error {
 	})
 }
 
+// SetSessionSummary stores or replaces a session's summary without ending the
+// session. Summaries live on the session row — NOT as recallable observations —
+// so recaps surface in recent context but never enter the search pool or the
+// decay/prune queue. Durable facts belong in typed observations (AddObservation).
+// A later call (e.g. the end-of-session summary after a mid-session compaction
+// recap) overwrites the previous one: latest recap wins.
+func (s *Store) SetSessionSummary(id, summary string) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		res, err := s.execHook(tx,
+			`UPDATE sessions SET summary = ? WHERE id = ?`,
+			nullableString(summary), id,
+		)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return nil
+		}
+
+		var startedAt, project, directory string
+		var endedAt, storedSummary *string
+		if err := tx.QueryRow(
+			`SELECT project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
+			id,
+		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
+			return err
+		}
+
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
+			ID:        id,
+			Project:   project,
+			Directory: directory,
+			StartedAt: startedAt,
+			EndedAt:   endedAt,
+			Summary:   storedSummary,
+		})
+	})
+}
+
 func (s *Store) GetSession(id string) (*Session, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
@@ -2238,7 +2312,15 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 }
 
 // SessionObservations returns all observations for a specific session.
+// Empty sessionID returns nil without querying. limit <= 0 defaults to 200
+// (TUI browse window); callers that want MaxContextResults should pass it.
+// Order is chronological ASC for TUI browsing. FormatContext durable ledger
+// uses SessionDurableLedger (newest-first under a tight cap) instead.
 func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, nil
+	}
 	if limit <= 0 {
 		limit = 200
 	}
@@ -2251,6 +2333,53 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 		LIMIT ?
 	`
 	return s.queryObservations(query, sessionID, limit)
+}
+
+// SessionDurableLedger returns the newest non-deleted observations for a
+// session (newest first), with scope filtered in SQL before LIMIT so mixed-scope
+// sessions do not under-fill the window. total is the full matching count
+// before LIMIT (for truncation messaging). Empty sessionID returns nil, 0, nil.
+func (s *Store) SessionDurableLedger(sessionID, scope string, limit int) ([]Observation, int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, 0, nil
+	}
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+		if limit <= 0 {
+			limit = 20
+		}
+	}
+
+	countQuery := `SELECT COUNT(*) FROM observations WHERE session_id = ? AND deleted_at IS NULL`
+	countArgs := []any{sessionID}
+	if scope != "" {
+		countQuery += " AND scope = ?"
+		countArgs = append(countArgs, normalizeScope(scope))
+	}
+	var total int
+	if err := s.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations
+		WHERE session_id = ? AND deleted_at IS NULL
+	`
+	args := []any{sessionID}
+	if scope != "" {
+		query += " AND scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+	query += " ORDER BY datetime(created_at) DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	obs, err := s.queryObservations(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	return obs, total, nil
 }
 
 // ─── Observations ────────────────────────────────────────────────────────────
@@ -2269,8 +2398,12 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
+	if topicKey == "" && autoTopicKeyTypes[p.Type] {
+		topicKey = normalizeTopicKey(SuggestTopicKey(p.Type, title, content))
+	}
 
 	var observationID int64
+	var dupBump bool // true when the save was a pure duplicate_count bump (content unchanged)
 	err := s.withTx(func(tx *sql.Tx) error {
 		var obs *Observation
 		if topicKey != "" {
@@ -2286,6 +2419,13 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				topicKey, nullableString(p.Project), scope,
 			).Scan(&existingID)
 			if err == nil {
+				// A revision restarts the review clock: the chain's content is
+				// fresh again, so it must not surface in the prune queue on the
+				// original insert's schedule (NULL when the type has no decay).
+				var reviewAfter any
+				if months, ok := decayReviewAfterMonths[p.Type]; ok {
+					reviewAfter = time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+				}
 				if _, err := s.execHook(tx,
 					`UPDATE observations
 					 SET type = ?,
@@ -2294,6 +2434,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					     tool_name = ?,
 					     topic_key = ?,
 					     normalized_hash = ?,
+					     review_after = ?,
 					     revision_count = revision_count + 1,
 					     last_seen_at = datetime('now'),
 					     updated_at = datetime('now')
@@ -2304,6 +2445,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					nullableString(p.ToolName),
 					nullableString(topicKey),
 					normHash,
+					reviewAfter,
 					existingID,
 				); err != nil {
 					return err
@@ -2336,6 +2478,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			normHash, nullableString(p.Project), scope, p.Type, title, window,
 		).Scan(&existingID)
 		if err == nil {
+			dupBump = true
 			if _, err := s.execHook(tx,
 				`UPDATE observations
 				 SET duplicate_count = duplicate_count + 1,
@@ -2397,10 +2540,25 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 	// Best-effort semantic indexing: a save must never fail because the
 	// embedding backend is down. Rows missed here are picked up by
-	// `engram embed backfill`.
+	// `engram embed backfill`. Pure duplicate bumps skip the round-trip —
+	// the content is unchanged, so the stored vector is already correct —
+	// unless the row has no vector yet (e.g. saved while the backend was
+	// down).
 	if s.embedder != nil {
-		if embErr := s.embedObservation(observationID, title, content); embErr != nil {
-			warnEmbedUnavailable(embErr)
+		needsEmbed := !dupBump
+		if dupBump {
+			var embedded bool
+			if qErr := s.db.QueryRow(
+				`SELECT embedding IS NOT NULL AND embedding_model = ? FROM observations WHERE id = ?`,
+				s.embedder.Model(), observationID,
+			).Scan(&embedded); qErr == nil {
+				needsEmbed = !embedded
+			}
+		}
+		if needsEmbed {
+			if embErr := s.embedObservation(observationID, title, content); embErr != nil {
+				warnEmbedUnavailable(embErr)
+			}
 		}
 	}
 
@@ -2512,6 +2670,27 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]
 	return s.queryObservations(query, args...)
 }
 
+// ObservationPointer returns the canonical compact-safe pointer for an observation ID.
+// Agents and compactors should keep this token in working context and rehydrate via
+// mem_get_observation instead of restating full durable content.
+func ObservationPointer(id int64) string {
+	return fmt.Sprintf("engram:obs/%d", id)
+}
+
+// formatObservationPointerLine renders a compact-safe ledger line.
+// When contentLimit > 0, a truncated body is appended after the title.
+func formatObservationPointerLine(obs Observation, contentLimit int) string {
+	topic := ""
+	if obs.TopicKey != nil && strings.TrimSpace(*obs.TopicKey) != "" {
+		topic = fmt.Sprintf(" topic=%s", *obs.TopicKey)
+	}
+	line := fmt.Sprintf("- %s [%s] **%s**%s", ObservationPointer(obs.ID), obs.Type, obs.Title, topic)
+	if contentLimit > 0 {
+		line += fmt.Sprintf(": %s", truncate(obs.Content, contentLimit))
+	}
+	return line
+}
+
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
 // An empty project searches all projects, matching existing browse/search conventions.
 func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observation, error) {
@@ -2534,6 +2713,112 @@ func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observat
 	query += " ORDER BY datetime(o.review_after) ASC, o.id ASC LIMIT ?"
 	args = append(args, limit)
 
+	return s.queryObservations(query, args...)
+}
+
+// decayEligibilityClause builds the SQL predicate (and its bind args) selecting
+// observations due for review under the CURRENT decay policy. It honors a stored
+// review_after when present (so mark_reviewed resets and typed decays are respected)
+// and otherwise falls back to a type-based offset from created_at — so legacy rows
+// that predate a policy change (review_after IS NULL) are still evaluated.
+// decayReviewAfterMonths stays the single source of truth: the per-type CASE is
+// generated from it. Because datetime(created_at, NULL) yields NULL and `NULL <= x`
+// is falsy, types absent from the policy map are naturally excluded from the fallback.
+func decayEligibilityClause() (string, []any) {
+	caseExpr := "CASE o.type"
+	args := []any{}
+	for _, t := range decayPolicyTypes() {
+		caseExpr += " WHEN ? THEN ?"
+		args = append(args, t, fmt.Sprintf("+%d months", decayReviewAfterMonths[t]))
+	}
+	caseExpr += " ELSE NULL END"
+	clause := "((o.review_after IS NOT NULL AND datetime(o.review_after) <= datetime('now'))" +
+		" OR (o.review_after IS NULL AND datetime(o.created_at, (" + caseExpr + ")) <= datetime('now')))"
+	return clause, args
+}
+
+// ObservationsPastDecay returns non-deleted, non-pinned observations due for review
+// under the current decay policy (see decayEligibilityClause), oldest first.
+// An empty project searches all projects; an empty typeFilter matches all types.
+// typeFilter is applied inside the query (before LIMIT) so a type-scoped call is not
+// starved by unrelated types crowding out the oldest-N window.
+func (s *Store) ObservationsPastDecay(project, typeFilter string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+	clause, args := decayEligibilityClause()
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+		  AND o.pinned = 0
+		  AND ` + clause
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if typeFilter != "" {
+		query += " AND o.type = ?"
+		args = append(args, typeFilter)
+	}
+	query += " ORDER BY datetime(o.created_at) ASC, o.id ASC LIMIT ?"
+	args = append(args, limit)
+	return s.queryObservations(query, args...)
+}
+
+// CountObservationsPastReview counts observations due for review under the current
+// decay policy. Cheap enough to call on every context load. Empty project = all projects.
+func (s *Store) CountObservationsPastReview(project string) (int, error) {
+	project, _ = NormalizeProject(project)
+	clause, args := decayEligibilityClause()
+	query := `SELECT COUNT(*) FROM observations o WHERE o.deleted_at IS NULL AND o.pinned = 0 AND ` + clause
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	var n int
+	if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ImmortalObservations returns non-deleted observations whose type has no decay
+// horizon (absent from decayReviewAfterMonths) — the rows the normal prune queue
+// never surfaces. Used by `engram prune --immortal` as the safety net for
+// immortal types: when the architecture materially changes (e.g. at a production
+// push), these notes must be re-read and updated to match, because nothing else
+// will ever flag them. Pinned rows are INCLUDED — accuracy matters most there.
+// Ordered least-recently-updated first: the longest-untouched notes are the
+// likeliest to be stale.
+func (s *Store) ImmortalObservations(project, typeFilter string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+	types := decayPolicyTypes()
+	placeholders := make([]string, len(types))
+	args := make([]any, 0, len(types)+3)
+	for i, t := range types {
+		placeholders[i] = "?"
+		args = append(args, t)
+	}
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+		  AND o.type NOT IN (` + strings.Join(placeholders, ", ") + `)`
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if typeFilter != "" {
+		query += " AND o.type = ?"
+		args = append(args, typeFilter)
+	}
+	query += " ORDER BY datetime(o.updated_at) ASC, o.id ASC LIMIT ?"
+	args = append(args, limit)
 	return s.queryObservations(query, args...)
 }
 
@@ -3117,18 +3402,27 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	results, _, err := s.SearchWithInfo(query, opts)
+	return results, err
+}
+
+// SearchWithInfo is Search plus a SearchInfo describing how the request was
+// actually served (which mode, and whether the semantic leg degraded), so
+// callers can surface silent hybrid→lexical fallbacks to the user.
+func (s *Store) SearchWithInfo(query string, opts SearchOptions) ([]SearchResult, SearchInfo, error) {
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
 	case "", "all", "any":
 		// valid
 	default:
-		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
+		return nil, SearchInfo{}, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
 	}
 
 	mode, err := s.resolveSearchMode(opts.Mode)
 	if err != nil {
-		return nil, err
+		return nil, SearchInfo{}, err
 	}
+	info := SearchInfo{Mode: mode}
 
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
@@ -3192,10 +3486,13 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		semanticResults, err = s.searchSemantic(query, opts, limit)
 		if err != nil {
 			if mode == SearchModeSemantic {
-				return nil, err
+				return nil, SearchInfo{}, err
 			}
 			warnEmbedUnavailable(err)
 			semanticResults = nil
+			info.Mode = SearchModeLexical
+			info.Degraded = true
+			info.DegradedReason = err.Error()
 		}
 		if mode == SearchModeSemantic {
 			seen := make(map[int64]bool)
@@ -3212,7 +3509,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			if len(results) > limit {
 				results = results[:limit]
 			}
-			return results, nil
+			return results, info, nil
 		}
 	}
 
@@ -3254,7 +3551,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	rows, err := s.queryItHook(s.db, sqlQ, args...)
 	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+		return nil, SearchInfo{}, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
 
@@ -3272,14 +3569,14 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
-			return nil, err
+			return nil, SearchInfo{}, err
 		}
 		if !seen[sr.ID] {
 			ftsResults = append(ftsResults, sr)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, SearchInfo{}, err
 	}
 
 	var results []SearchResult
@@ -3301,7 +3598,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	if len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
+	return results, info, nil
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
@@ -3385,7 +3682,51 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 {
+	// Session durable ledger: newest compact-safe facts for the active (or
+	// fallback) session. Pointer-only — do not restate full bodies here.
+	var sessionDurable []Observation
+	var sessionDurableTotal int
+	var durableHeading string // empty when no ledger section
+	if project != "" {
+		var sessionDurableID string
+		if sid, ok, sessErr := s.MostRecentActiveSession(project); sessErr == nil && ok {
+			sessionDurableID = sid
+			durableHeading = "### Durable this session (safe to pointer-compact)\n"
+		} else if len(sessions) > 0 && sessions[0].ObservationCount > 0 {
+			// No open harness session — surface latest session with
+			// observations (label must not claim "this session").
+			sessionDurableID = sessions[0].ID
+			durableHeading = "### Durable coverage (latest session) (safe to pointer-compact)\n"
+		} else {
+			// Implicit MCP writes land on manual-save-{project}.
+			sessionDurableID = "manual-save-" + project
+			durableHeading = "### Durable coverage (manual-save) (safe to pointer-compact)\n"
+		}
+		sessionDurable, sessionDurableTotal, err = s.SessionDurableLedger(sessionDurableID, scope, s.cfg.MaxContextResults)
+		if err != nil {
+			return "", err
+		}
+		if len(sessionDurable) == 0 {
+			durableHeading = ""
+		}
+	}
+
+	// IDs already shown as pointer-only under the durable ledger must not
+	// reappear under Pinned/Recent with 300-char bodies (token regression).
+	durableIDs := make(map[int64]struct{}, len(sessionDurable))
+	for _, obs := range sessionDurable {
+		durableIDs[obs.ID] = struct{}{}
+	}
+	pinned = filterObservationsNotIn(pinned, durableIDs)
+	observations = filterObservationsNotIn(observations, durableIDs)
+
+	reviewCount, _ := s.CountObservationsPastReview(project)
+	// Gate the maintenance nudge: a small backlog on every context load is
+	// itself noise. Only nag once the queue is meaningfully backed up, which
+	// also batches triage into fewer, larger passes.
+	showMaintenance := reviewCount > maintenanceNudgeThreshold
+
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && len(sessionDurable) == 0 && !showMaintenance {
 		return "", nil
 	}
 
@@ -3394,15 +3735,38 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 
 	if len(sessions) > 0 {
 		b.WriteString("### Recent Sessions\n")
+		// Summaries live on the session row (not as observations), so this list
+		// is the primary recap channel: render the most recent summarized
+		// session at depth, older ones as one-liners.
+		fullSummaryShown := false
 		for _, sess := range sessions {
 			summary := ""
 			if sess.Summary != nil {
-				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, 200))
+				limit := 200
+				if !fullSummaryShown {
+					limit = 800
+					fullSummaryShown = true
+				}
+				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, limit))
 			}
 			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
 				sess.Project, timeutil.FormatLocal(sess.StartedAt), summary, sess.ObservationCount)
 		}
 		b.WriteString("\n")
+	}
+
+	if len(sessionDurable) > 0 && durableHeading != "" {
+		b.WriteString(durableHeading)
+		b.WriteString("These facts are already on the Engram durable path. Keep the pointer; drop investigative trails. Rehydrate with mem_get_observation(id).\n")
+		for _, obs := range sessionDurable {
+			b.WriteString(formatObservationPointerLine(obs, 0))
+			b.WriteByte('\n')
+		}
+		if sessionDurableTotal > len(sessionDurable) {
+			fmt.Fprintf(&b, "Count: %d of %d (showing newest) — unsaved working state is NOT listed.\n\n", len(sessionDurable), sessionDurableTotal)
+		} else {
+			fmt.Fprintf(&b, "Count: %d — unsaved working state is NOT listed.\n\n", len(sessionDurable))
+		}
 	}
 
 	if len(prompts) > 0 {
@@ -3416,8 +3780,8 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(pinned) > 0 {
 		b.WriteString("### Pinned\n")
 		for _, obs := range pinned {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			b.WriteString(formatObservationPointerLine(obs, 300))
+			b.WriteByte('\n')
 		}
 		b.WriteString("\n")
 	}
@@ -3425,13 +3789,32 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			b.WriteString(formatObservationPointerLine(obs, 300))
+			b.WriteByte('\n')
 		}
 		b.WriteString("\n")
 	}
 
+	if showMaintenance {
+		fmt.Fprintf(&b, "### ⚠️ Memory Maintenance\n%d observations past their review horizon. Run `engram prune` to triage — delete stale/superseded notes (extract any durable value into a typed note first).\n\n", reviewCount)
+	}
+
 	return b.String(), nil
+}
+
+// filterObservationsNotIn returns obs excluding any id present in skip.
+func filterObservationsNotIn(obs []Observation, skip map[int64]struct{}) []Observation {
+	if len(skip) == 0 || len(obs) == 0 {
+		return obs
+	}
+	out := make([]Observation, 0, len(obs))
+	for _, o := range obs {
+		if _, drop := skip[o.ID]; drop {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
 }
 
 // ─── Export / Import ─────────────────────────────────────────────────────────

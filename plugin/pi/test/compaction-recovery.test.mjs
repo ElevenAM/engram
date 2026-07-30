@@ -19,8 +19,12 @@ test("recoveryInstruction keeps manual FIRST ACTION REQUIRED fallback", () => {
   const notice = recoveryInstruction("engram");
   assert.match(notice, /FIRST ACTION REQUIRED/);
   assert.match(notice, /mem_session_summary/);
+  assert.match(notice, /mem_save/);
+  assert.match(notice, /compact_safe/);
+  assert.match(notice, /Durable Coverage/);
+  assert.match(notice, /mem_context/);
   assert.match(notice, /gentle-engram and the Engram MCP tools are installed and active/);
-  assert.match(notice, /If mem_session_summary is unavailable/);
+  assert.match(notice, /If Engram tools are unavailable/);
 });
 
 test("buildRecoveryNotice prefixes context when available", () => {

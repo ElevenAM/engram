@@ -333,19 +333,31 @@ func TestPinnedObservationsAndFormatContextPriority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("format context: %v", err)
 	}
-	pinnedIdx := strings.Index(ctx, "### Pinned")
-	recentIdx := strings.Index(ctx, "### Recent Observations")
-	if pinnedIdx < 0 || recentIdx < 0 || pinnedIdx > recentIdx {
-		t.Fatalf("expected pinned section before recent observations, got:\n%s", ctx)
-	}
-	if !strings.Contains(ctx, "pinned architecture") {
-		t.Fatalf("expected pinned observation in context, got:\n%s", ctx)
+	// Newest two session facts land in Durable (MaxContextResults=2); they must
+	// not reappear under Pinned/Recent. Pinned architecture is older than the
+	// durable window once ordered by created_at, so it may still pin-render.
+	if !strings.Contains(ctx, "### Durable this session") {
+		t.Fatalf("expected durable this session section, got:\n%s", ctx)
 	}
 	if !strings.Contains(ctx, "recent three") || !strings.Contains(ctx, "recent two") {
-		t.Fatalf("expected max recent unpinned observations in context, got:\n%s", ctx)
+		t.Fatalf("expected newest unpinned titles in durable ledger, got:\n%s", ctx)
 	}
-	if strings.Contains(ctx, "recent one") {
-		t.Fatalf("expected recent window to stay at MaxContextResults, got:\n%s", ctx)
+	if !strings.Contains(ctx, "engram:obs/") {
+		t.Fatalf("expected pointer-prefixed observation lines, got:\n%s", ctx)
+	}
+	// Dedupe: durable IDs must not reappear under Recent with bodies.
+	if recentIdx := strings.Index(ctx, "### Recent Observations"); recentIdx >= 0 {
+		recentBlock := ctx[recentIdx:]
+		if strings.Contains(recentBlock, "recent three") || strings.Contains(recentBlock, "recent two") {
+			t.Fatalf("durable newest rows must not reappear under Recent:\n%s", recentBlock)
+		}
+	}
+	// Pinned section only if the pinned row was not absorbed by durable window.
+	// With created_at day1..day4 and limit 2, durable = day4+day3; pinned day1 stays pinned.
+	if pinnedIdx := strings.Index(ctx, "### Pinned"); pinnedIdx >= 0 {
+		if !strings.Contains(ctx[pinnedIdx:], "pinned architecture") {
+			t.Fatalf("expected pinned architecture when outside durable window, got:\n%s", ctx)
+		}
 	}
 	exported, err := s.ExportProject("engram")
 	if err != nil {
@@ -8692,5 +8704,546 @@ func TestSearchMatchMode_EmptyQueryAnyReturnsError(t *testing.T) {
 	_, err := s.Search("", SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
 	if err == nil {
 		t.Fatal("expected error for empty query with match_mode=any, got nil")
+	}
+}
+
+// ─── Two-tier pruning follow-ups: auto topic chains, immortal audit, nudge gate ───
+
+func TestAutoTopicKeyChainsStatusTypes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-auto", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "discovery", Title: "P34 rollout status",
+		Content: "phase 1 deployed", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	first, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get first: %v", err)
+	}
+	if first.TopicKey == nil || *first.TopicKey == "" {
+		t.Fatal("discovery save without topic_key must get an auto-assigned one")
+	}
+	if first.ReviewAfter == nil {
+		t.Fatal("discovery insert must carry a review_after")
+	}
+	firstReview := *first.ReviewAfter
+
+	secondID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "discovery", Title: "P34 rollout status",
+		Content: "phase 2 deployed, phase 1 verified", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if secondID != firstID {
+		t.Fatalf("same-title discovery must revise the chain, not insert: got new id %d (want %d)", secondID, firstID)
+	}
+	revised, err := s.GetObservation(firstID)
+	if err != nil {
+		t.Fatalf("get revised: %v", err)
+	}
+	if revised.RevisionCount != 2 {
+		t.Fatalf("revision_count = %d, want 2", revised.RevisionCount)
+	}
+	if revised.Content != "phase 2 deployed, phase 1 verified" {
+		t.Fatalf("chain content not replaced: %q", revised.Content)
+	}
+	if revised.ReviewAfter == nil || *revised.ReviewAfter < firstReview {
+		t.Fatalf("revision must restart the review clock: first=%q revised=%v", firstReview, revised.ReviewAfter)
+	}
+
+	// Durable types must NOT auto-chain: identical titles can be distinct facts.
+	bugAID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "bugfix", Title: "Fix flaky test",
+		Content: "auth test raced on token refresh", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("bugfix A: %v", err)
+	}
+	bugA, err := s.GetObservation(bugAID)
+	if err != nil {
+		t.Fatalf("get bugfix A: %v", err)
+	}
+	if bugA.TopicKey != nil && *bugA.TopicKey != "" {
+		t.Fatalf("bugfix must not get an auto topic_key, got %q", *bugA.TopicKey)
+	}
+	bugBID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-auto", Type: "bugfix", Title: "Fix flaky test",
+		Content: "search test depended on wall clock", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("bugfix B: %v", err)
+	}
+	if bugBID == bugAID {
+		t.Fatal("identically-titled bugfixes must remain separate rows")
+	}
+}
+
+func TestImmortalObservationsListsNonDecayingTypes(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-imm", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	archID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "architecture", Title: "Hexagonal store boundary",
+		Content: "store package stays hermetic", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("architecture save: %v", err)
+	}
+	if err := s.PinObservation(archID); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "bugfix", Title: "Fix NULL review_after fallback",
+		Content: "legacy rows evaluated from created_at", Project: "engram",
+	}); err != nil {
+		t.Fatalf("bugfix save: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-imm", Type: "discovery", Title: "CI cache quirk",
+		Content: "decays, must not appear", Project: "engram",
+	}); err != nil {
+		t.Fatalf("discovery save: %v", err)
+	}
+
+	obs, err := s.ImmortalObservations("engram", "", 50)
+	if err != nil {
+		t.Fatalf("ImmortalObservations: %v", err)
+	}
+	types := map[string]bool{}
+	sawPinnedArch := false
+	for _, o := range obs {
+		types[o.Type] = true
+		if o.Type == "architecture" && o.Pinned {
+			sawPinnedArch = true
+		}
+	}
+	if !types["architecture"] || !types["bugfix"] {
+		t.Fatalf("expected architecture+bugfix in immortal audit, got %v", types)
+	}
+	if types["discovery"] {
+		t.Fatal("decaying type 'discovery' must not appear in the immortal audit")
+	}
+	if !sawPinnedArch {
+		t.Fatal("pinned immortal notes must be INCLUDED in the audit (accuracy matters most there)")
+	}
+
+	filtered, err := s.ImmortalObservations("engram", "bugfix", 50)
+	if err != nil {
+		t.Fatalf("ImmortalObservations type filter: %v", err)
+	}
+	for _, o := range filtered {
+		if o.Type != "bugfix" {
+			t.Fatalf("type filter leaked %q", o.Type)
+		}
+	}
+	if len(filtered) == 0 {
+		t.Fatal("type-filtered immortal audit returned nothing")
+	}
+}
+
+func TestSetSessionSummaryStoresOnSessionRow(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-sum", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := s.SetSessionSummary("s-sum", "## Goal\nfirst recap"); err != nil {
+		t.Fatalf("SetSessionSummary: %v", err)
+	}
+	sess, err := s.GetSession("s-sum")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Summary == nil || *sess.Summary != "## Goal\nfirst recap" {
+		t.Fatalf("summary not stored on session row: %v", sess.Summary)
+	}
+	if sess.EndedAt != nil {
+		t.Fatal("SetSessionSummary must not end the session")
+	}
+
+	if err := s.SetSessionSummary("s-sum", "## Goal\nfinal recap"); err != nil {
+		t.Fatalf("second SetSessionSummary: %v", err)
+	}
+	sess, err = s.GetSession("s-sum")
+	if err != nil {
+		t.Fatalf("GetSession after overwrite: %v", err)
+	}
+	if sess.Summary == nil || *sess.Summary != "## Goal\nfinal recap" {
+		t.Fatalf("latest recap must win, got %v", sess.Summary)
+	}
+
+	// No observation may be created by a session summary anymore.
+	obs, err := s.RecentObservations("engram", "", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+	for _, o := range obs {
+		if o.Type == "session_summary" {
+			t.Fatal("session summaries must not be stored as observations")
+		}
+	}
+}
+
+func TestObservationPointer(t *testing.T) {
+	if got := ObservationPointer(42); got != "engram:obs/42" {
+		t.Fatalf("ObservationPointer(42) = %q, want engram:obs/42", got)
+	}
+}
+
+func TestSessionObservationsAndFormatContextDurableLedger(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.MaxContextResults = 10
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("sess-active", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create active session: %v", err)
+	}
+	if err := s.CreateSession("sess-old", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create old session: %v", err)
+	}
+	// Close the older session so MostRecentActiveSession prefers sess-active.
+	if err := s.EndSession("sess-old", "done"); err != nil {
+		t.Fatalf("end old session: %v", err)
+	}
+
+	activeID, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-active",
+		Type:      "decision",
+		Title:     "Chose JWT auth",
+		Content:   "Switched to JWT for multi-instance auth",
+		Project:   "engram",
+		Scope:     "project",
+		TopicKey:  "architecture/auth-model",
+	})
+	if err != nil {
+		t.Fatalf("add active observation: %v", err)
+	}
+	oldID, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-old",
+		Type:      "bugfix",
+		Title:     "Old session only",
+		Content:   "Should not appear in this-session ledger",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add old observation: %v", err)
+	}
+
+	sessionObs, err := s.SessionObservations("sess-active", 10)
+	if err != nil {
+		t.Fatalf("SessionObservations: %v", err)
+	}
+	if len(sessionObs) != 1 || sessionObs[0].ID != activeID {
+		t.Fatalf("SessionObservations = %#v, want only id %d", sessionObs, activeID)
+	}
+	empty, err := s.SessionObservations("", 10)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty session id should return nil/empty, got %#v err=%v", empty, err)
+	}
+
+	ctx, err := s.FormatContext("engram", "project")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if !strings.Contains(ctx, "### Durable this session (safe to pointer-compact)") {
+		t.Fatalf("expected durable this session section, got:\n%s", ctx)
+	}
+	pointer := ObservationPointer(activeID)
+	if !strings.Contains(ctx, pointer) {
+		t.Fatalf("expected pointer %s in context, got:\n%s", pointer, ctx)
+	}
+	if !strings.Contains(ctx, "topic=architecture/auth-model") {
+		t.Fatalf("expected topic_key in durable ledger, got:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "Chose JWT auth") {
+		t.Fatalf("expected active title in durable ledger, got:\n%s", ctx)
+	}
+	// Old session obs may still appear under Recent Observations, but the
+	// durable-this-session block must list only the active session's pointer.
+	durableIdx := strings.Index(ctx, "### Durable this session")
+	if durableIdx < 0 {
+		t.Fatalf("expected durable section, got:\n%s", ctx)
+	}
+	recentIdx := strings.Index(ctx, "### Recent Observations")
+	endDurable := len(ctx)
+	if recentIdx >= 0 {
+		endDurable = recentIdx
+	}
+	durableBlock := ctx[durableIdx:endDurable]
+	if strings.Contains(durableBlock, ObservationPointer(oldID)) {
+		t.Fatalf("old session observation must not be in durable-this-session block:\n%s", durableBlock)
+	}
+	// This-session fact must not reappear under Recent with a body (dedupe).
+	if recentIdx >= 0 {
+		recentBlock := ctx[recentIdx:]
+		if strings.Contains(recentBlock, pointer) {
+			t.Fatalf("durable this-session pointer must not reappear under Recent:\n%s", recentBlock)
+		}
+	}
+	// Prior-session fact still surfaces under Recent.
+	if !strings.Contains(ctx, ObservationPointer(oldID)) && !strings.Contains(ctx, "Old session only") {
+		t.Fatalf("expected prior-session observation in context, got:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "engram:obs/") {
+		t.Fatalf("expected pointer-prefixed observation lines, got:\n%s", ctx)
+	}
+}
+
+func TestSessionDurableLedger_NewestFirstUnderLimit(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.MaxContextResults = 2
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("sess-busy", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	ids := make([]int64, 0, 5)
+	for i := 1; i <= 5; i++ {
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: "sess-busy",
+			Type:      "decision",
+			Title:     fmt.Sprintf("save-%d", i),
+			Content:   fmt.Sprintf("body %d", i),
+			Project:   "engram",
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+		// Force chronological created_at so LIMIT selection is deterministic.
+		ts := fmt.Sprintf("2026-03-0%d 00:00:00", i)
+		if _, err := s.db.Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE id = ?`, ts, ts, id); err != nil {
+			t.Fatalf("set created_at: %v", err)
+		}
+		ids = append(ids, id)
+	}
+
+	ledger, total, err := s.SessionDurableLedger("sess-busy", "project", 2)
+	if err != nil {
+		t.Fatalf("SessionDurableLedger: %v", err)
+	}
+	if total != 5 {
+		t.Fatalf("total = %d, want 5", total)
+	}
+	if len(ledger) != 2 {
+		t.Fatalf("ledger len = %d, want 2", len(ledger))
+	}
+	// Newest-first: save-5 then save-4.
+	if ledger[0].ID != ids[4] || ledger[0].Title != "save-5" {
+		t.Fatalf("first ledger entry = %#v, want newest id=%d save-5", ledger[0], ids[4])
+	}
+	if ledger[1].ID != ids[3] || ledger[1].Title != "save-4" {
+		t.Fatalf("second ledger entry = %#v, want id=%d save-4", ledger[1], ids[3])
+	}
+
+	ctx, err := s.FormatContext("engram", "project")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if !strings.Contains(ctx, ObservationPointer(ids[4])) || !strings.Contains(ctx, ObservationPointer(ids[3])) {
+		t.Fatalf("context durable ledger must include newest two pointers, got:\n%s", ctx)
+	}
+	if strings.Contains(ctx, ObservationPointer(ids[0])) {
+		// Oldest should not be in durable window (limit 2).
+		durableIdx := strings.Index(ctx, "### Durable this session")
+		recentIdx := strings.Index(ctx, "### Recent Observations")
+		end := len(ctx)
+		if recentIdx > durableIdx {
+			end = recentIdx
+		}
+		if durableIdx >= 0 && strings.Contains(ctx[durableIdx:end], ObservationPointer(ids[0])) {
+			t.Fatalf("oldest save must not be in durable window:\n%s", ctx[durableIdx:end])
+		}
+	}
+	if !strings.Contains(ctx, "Count: 2 of 5 (showing newest)") {
+		t.Fatalf("expected truncated count line, got:\n%s", ctx)
+	}
+}
+
+func TestSessionDurableLedger_ScopeBeforeLimit(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.MaxContextResults = 2
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("sess-mixed", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// Insert newest-first by created_at: three project, interleaved with personal.
+	// If scope is filtered AFTER LIMIT of 2, personal-newest would starve project rows.
+	type row struct {
+		title, scope, ts string
+	}
+	plan := []row{
+		{"proj-old", "project", "2026-03-01 00:00:00"},
+		{"pers-mid", "personal", "2026-03-02 00:00:00"},
+		{"proj-mid", "project", "2026-03-03 00:00:00"},
+		{"pers-new", "personal", "2026-03-04 00:00:00"},
+		{"proj-new", "project", "2026-03-05 00:00:00"},
+	}
+	for _, p := range plan {
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: "sess-mixed",
+			Type:      "decision",
+			Title:     p.title,
+			Content:   p.title + " body",
+			Project:   "engram",
+			Scope:     p.scope,
+		})
+		if err != nil {
+			t.Fatalf("add %s: %v", p.title, err)
+		}
+		if _, err := s.db.Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE id = ?`, p.ts, p.ts, id); err != nil {
+			t.Fatalf("set created_at: %v", err)
+		}
+	}
+
+	ledger, total, err := s.SessionDurableLedger("sess-mixed", "project", 2)
+	if err != nil {
+		t.Fatalf("SessionDurableLedger: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("project total = %d, want 3", total)
+	}
+	if len(ledger) != 2 {
+		t.Fatalf("ledger len = %d, want 2", len(ledger))
+	}
+	if ledger[0].Title != "proj-new" || ledger[1].Title != "proj-mid" {
+		t.Fatalf("want newest project rows, got %q then %q", ledger[0].Title, ledger[1].Title)
+	}
+}
+
+func TestFormatContext_LatestSessionLabelAndDedupe(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.MaxContextResults = 5
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("sess-ended", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-ended",
+		Type:      "decision",
+		Title:     "Ended session fact",
+		Content:   "Only in ended session — should use latest-session label",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := s.EndSession("sess-ended", "done"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	ctx, err := s.FormatContext("engram", "project")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if strings.Contains(ctx, "### Durable this session") {
+		t.Fatalf("ended-only session must not use 'this session' heading:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "### Durable coverage (latest session)") {
+		t.Fatalf("expected latest-session durable heading, got:\n%s", ctx)
+	}
+	ptr := ObservationPointer(id)
+	if !strings.Contains(ctx, ptr) {
+		t.Fatalf("expected pointer %s, got:\n%s", ptr, ctx)
+	}
+	// Dedupe: no body re-injection under Recent for the durable row.
+	if recentIdx := strings.Index(ctx, "### Recent Observations"); recentIdx >= 0 {
+		if strings.Contains(ctx[recentIdx:], ptr) {
+			t.Fatalf("durable row must not reappear under Recent:\n%s", ctx[recentIdx:])
+		}
+	}
+}
+
+func TestFormatContextMaintenanceNudgeGate(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-gate", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Titles must be unique across calls: same-titled discovery saves would
+	// auto-chain into one row (by design) instead of growing the queue.
+	seq := 0
+	expire := func(n int) {
+		for i := 0; i < n; i++ {
+			seq++
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-gate", Type: "discovery",
+				Title:   fmt.Sprintf("stale status note %d", seq),
+				Content: fmt.Sprintf("stale content %d", seq), Project: "engram",
+			})
+			if err != nil {
+				t.Fatalf("save %d: %v", seq, err)
+			}
+			if _, err := s.db.Exec(`UPDATE observations SET review_after = '2020-01-01 00:00:00' WHERE id = ?`, id); err != nil {
+				t.Fatalf("expire %d: %v", seq, err)
+			}
+		}
+	}
+
+	expire(maintenanceNudgeThreshold) // exactly at threshold — must stay silent
+	out, err := s.FormatContext("engram", "")
+	if err != nil {
+		t.Fatalf("FormatContext: %v", err)
+	}
+	if strings.Contains(out, "Memory Maintenance") {
+		t.Fatalf("nudge must be gated at <= %d past-review observations:\n%s", maintenanceNudgeThreshold, out)
+	}
+
+	expire(1) // one over the threshold — nudge appears
+	out, err = s.FormatContext("engram", "")
+	if err != nil {
+		t.Fatalf("FormatContext over threshold: %v", err)
+	}
+	if !strings.Contains(out, "Memory Maintenance") {
+		t.Fatalf("expected maintenance nudge above threshold:\n%s", out)
+	}
+}
+
+func TestDecayEligibilityClauseDeterministic(t *testing.T) {
+	sql1, args1 := decayEligibilityClause()
+	sql2, args2 := decayEligibilityClause()
+	if sql1 != sql2 {
+		t.Fatalf("clause SQL must be deterministic:\n%s\nvs\n%s", sql1, sql2)
+	}
+	if len(args1) != len(args2) {
+		t.Fatalf("arg count mismatch: %d vs %d", len(args1), len(args2))
+	}
+	for i := range args1 {
+		if args1[i] != args2[i] {
+			t.Fatalf("args diverge at %d: %v vs %v", i, args1[i], args2[i])
+		}
 	}
 }

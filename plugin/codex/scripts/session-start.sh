@@ -170,8 +170,15 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - User mentions a topic you have no context on
 - User's FIRST message references the project, a feature, or a problem — call `mem_search` with keywords from their message to check for prior work before responding
 
+### COMPACT-SAFE — after each mem_save
+Envelope returns compact_safe=true and pointer engram:obs/<id>. Drop investigative trail; keep pointer. Rehydrate with mem_get_observation.
+
 ### SESSION CLOSE — before saying "done":
-Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+1. `mem_save` any still-unsaved durable facts FIRST
+2. Call `mem_session_summary` with: Durable Coverage (engram:obs/<id> pointers), Goal, Discoveries, Accomplished, Next Steps, Relevant Files. Do not restate full compact_safe bodies.
+
+### AFTER COMPACTION
+mem_save remaining durable facts → pointer-first mem_session_summary → mem_context (Durable this session) → continue.
 PROTOCOL
 
 # Inject memory context if available

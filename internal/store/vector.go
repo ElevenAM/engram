@@ -50,6 +50,24 @@ const embedTextLimit = 2000
 // lexical and semantic result lists in hybrid mode.
 const rrfK = 60
 
+// saveEmbedTimeout caps the embedding call made inline on the save path.
+// Saves run through the single-worker MCP write queue, so a slow-but-alive
+// backend must not be allowed to hold the queue for the embed client's full
+// timeout — a save that misses this window is picked up by backfill.
+const saveEmbedTimeout = 3 * time.Second
+
+// SearchInfo reports how a search was actually served, so callers can tell a
+// healthy hybrid response from one that silently degraded to keyword-only.
+type SearchInfo struct {
+	// Mode that produced the results: lexical, semantic, or hybrid.
+	Mode string `json:"mode"`
+	// Degraded is true when hybrid was requested (or auto-resolved) but the
+	// semantic leg failed, so results are lexical-only.
+	Degraded bool `json:"degraded,omitempty"`
+	// DegradedReason is the backend error that caused the degradation.
+	DegradedReason string `json:"degraded_reason,omitempty"`
+}
+
 var embedWarnOnce sync.Once
 
 // SetEmbedder configures the embedding backend. nil disables semantic search
@@ -114,7 +132,9 @@ func (s *Store) embedObservation(id int64, title, content string) error {
 	if s.embedder == nil {
 		return nil
 	}
-	vecs, err := s.embedder.Embed(context.Background(), []string{embedText(title, content)})
+	ctx, cancel := context.WithTimeout(context.Background(), saveEmbedTimeout)
+	defer cancel()
+	vecs, err := s.embedder.Embed(ctx, []string{embedText(title, content)})
 	if err != nil {
 		return err
 	}
@@ -202,6 +222,7 @@ func (s *Store) searchSemantic(query string, opts SearchOptions, limit int) ([]S
 		sim float64
 	}
 	var candidates []scored
+	var corruptVectors []int64
 	for rows.Next() {
 		var id int64
 		var blob []byte
@@ -210,13 +231,20 @@ func (s *Store) searchSemantic(query string, opts SearchOptions, limit int) ([]S
 		}
 		vec, err := DecodeVector(blob)
 		if err != nil {
-			continue // corrupt blob: skip the row, don't fail the search
+			// Corrupt blob: don't fail the search, but don't skip silently
+			// either — a non-NULL blob with a matching model tag is invisible
+			// to both backfill and embed status. NULL it out so the row
+			// re-enrolls in the backfill predicate and self-heals.
+			corruptVectors = append(corruptVectors, id)
+			continue
 		}
 		candidates = append(candidates, scored{id: id, sim: Cosine(qVec, vec)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	s.healCorruptVectors(corruptVectors)
 
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].sim > candidates[j].sim })
 	if len(candidates) > limit {
@@ -245,6 +273,27 @@ func (s *Store) searchSemantic(query string, opts SearchOptions, limit int) ([]S
 		results = append(results, SearchResult{Observation: obs, Rank: -c.sim})
 	}
 	return results, nil
+}
+
+// healCorruptVectors clears embeddings that failed to decode so the rows
+// re-enter the backfill predicate (embedding IS NULL) instead of remaining
+// permanently invisible to semantic search, backfill, and embed status.
+func (s *Store) healCorruptVectors(ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+	log.Printf("engram: %d corrupt embedding blob(s) detected (observation ids %v); clearing so `engram embed backfill` re-embeds them", len(ids), ids)
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	if _, err := s.execHook(s.db,
+		`UPDATE observations SET embedding = NULL, embedding_model = NULL, embedding_created_at = NULL WHERE id IN (`+placeholders+`)`,
+		args...,
+	); err != nil {
+		log.Printf("engram: failed to clear corrupt embeddings: %v", err)
+	}
 }
 
 // observationsByID loads full observation rows for the given IDs.

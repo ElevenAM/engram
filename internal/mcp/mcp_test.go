@@ -1876,6 +1876,102 @@ func TestHandleSave_NoCandidates_ResultUnchanged(t *testing.T) {
 	if strings.Contains(result, "CONFLICT REVIEW PENDING") {
 		t.Fatalf("unexpected CONFLICT REVIEW PENDING in result when no candidates")
 	}
+
+	// Phase 1: compact-safe certificate on successful save.
+	if cs, ok := envelope["compact_safe"].(bool); !ok || !cs {
+		t.Fatalf("expected compact_safe=true, got %v", envelope["compact_safe"])
+	}
+	id, ok := envelope["id"].(float64)
+	if !ok || id == 0 {
+		t.Fatalf("expected numeric id in envelope, got %v", envelope["id"])
+	}
+	wantPointer := fmt.Sprintf("engram:obs/%d", int64(id))
+	if ptr, _ := envelope["pointer"].(string); ptr != wantPointer {
+		t.Fatalf("pointer = %q, want %q", ptr, wantPointer)
+	}
+	if !strings.Contains(result, "compact_safe:") || !strings.Contains(result, wantPointer) {
+		t.Fatalf("result should teach compact_safe drop rule with pointer, got %q", result)
+	}
+}
+
+func TestHandleSave_CompactSafeEnvelope_AlwaysPresent(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":     "JWT auth decision",
+		"content":   "**What**: Chose JWT\n**Why**: scale\n**Where**: auth.ts",
+		"type":      "decision",
+		"topic_key": "architecture/auth-model",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if cs, _ := envelope["compact_safe"].(bool); !cs {
+		t.Fatalf("compact_safe missing/false: %#v", envelope)
+	}
+	if _, ok := envelope["pointer"].(string); !ok {
+		t.Fatalf("pointer missing: %#v", envelope)
+	}
+	if tk, _ := envelope["topic_key"].(string); tk != "architecture/auth-model" {
+		t.Fatalf("topic_key = %q, want architecture/auth-model", tk)
+	}
+	if title, _ := envelope["title"].(string); title != "JWT auth decision" {
+		t.Fatalf("title = %q", title)
+	}
+	if typ, _ := envelope["type"].(string); typ != "decision" {
+		t.Fatalf("type = %q", typ)
+	}
+}
+
+func TestHandleContext_IncludesDurableThisSession(t *testing.T) {
+	s := newMCPTestStore(t)
+	// Create an active session and observation the way plugins do.
+	if err := s.CreateSession("hook-session-1", "engram", t.TempDir()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "hook-session-1",
+		Type:      "decision",
+		Title:     "Pointer ledger fact",
+		Content:   "Durable content for context ledger",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	h := handleContext(s, MCPConfig{DefaultProject: "engram"}, NewSessionActivity(10*time.Minute))
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	text := callResultText(t, res)
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("json: %v — %s", err, text)
+	}
+	result, _ := envelope["result"].(string)
+	if !strings.Contains(result, "Durable this session") {
+		t.Fatalf("expected Durable this session in mem_context, got:\n%s", result)
+	}
+	if !strings.Contains(result, store.ObservationPointer(id)) {
+		t.Fatalf("expected pointer for id %d in mem_context, got:\n%s", id, result)
+	}
 }
 
 // D.3 — topic_key revision also triggers candidate detection.
@@ -5661,6 +5757,23 @@ func TestMemSaveSchemaIncludesCapturePrompt(t *testing.T) {
 	}
 }
 
+// sessionSummaryFor returns the stored summary of the project's most recent
+// summarized session. Summaries live on the session row (not as observations),
+// so this is how tests assert mem_session_summary persisted anything.
+func sessionSummaryFor(t *testing.T, s *store.Store, project string) string {
+	t.Helper()
+	sessions, err := s.RecentSessions(project, 10)
+	if err != nil {
+		t.Fatalf("RecentSessions(%q): %v", project, err)
+	}
+	for _, sess := range sessions {
+		if sess.Summary != nil && *sess.Summary != "" {
+			return *sess.Summary
+		}
+	}
+	return ""
+}
+
 // TestMemSessionSummary_AutoDetectsProject: summary is stored under the auto-detected project.
 func TestMemSessionSummary_AutoDetectsProject(t *testing.T) {
 	dir := t.TempDir()
@@ -5684,9 +5797,8 @@ func TestMemSessionSummary_AutoDetectsProject(t *testing.T) {
 		t.Fatalf("session summary: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("summary-auto-project", "project", 5)
-	if err != nil || len(obs) == 0 {
-		t.Fatal("expected session_summary observation under auto-detected project 'summary-auto-project'")
+	if got := sessionSummaryFor(t, s, "summary-auto-project"); !strings.Contains(got, "Test auto-detection") {
+		t.Fatalf("expected session summary stored under auto-detected project 'summary-auto-project'; got %q", got)
 	}
 
 	m := callResultJSON(t, res)
@@ -6996,12 +7108,8 @@ func TestSessionSummary_ProcessOverrideWritesToDefaultProject(t *testing.T) {
 		t.Fatalf("session summary error: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("trusted project", "project", 5)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	if len(obs) == 0 {
-		t.Fatal("expected session_summary observation under 'trusted project' (process override); got none")
+	if got := sessionSummaryFor(t, s, "trusted project"); !strings.Contains(got, "Process override session summary") {
+		t.Fatalf("expected session summary under 'trusted project' (process override); got %q", got)
 	}
 
 	m := callResultJSON(t, res)
@@ -7037,12 +7145,8 @@ func TestSessionSummary_ProcessOverrideBypassesAmbiguousCWD(t *testing.T) {
 		t.Fatalf("expected success via process override; err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
 	}
 
-	obs, err := s.RecentObservations("override-project", "project", 5)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	if len(obs) == 0 {
-		t.Fatal("expected session_summary under 'override-project'; got none")
+	if got := sessionSummaryFor(t, s, "override-project"); !strings.Contains(got, "Ambiguous override test") {
+		t.Fatalf("expected session summary under 'override-project'; got %q", got)
 	}
 }
 

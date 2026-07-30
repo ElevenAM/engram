@@ -61,8 +61,22 @@ func init() {
 	}
 }
 
+// newStoreFromEnv opens the store and attaches the embedding backend when
+// ENGRAM_EMBEDDINGS is configured. Env wiring lives here at the app boundary
+// (not in store.New) so the store package stays hermetic under test.
+func newStoreFromEnv(cfg store.Config) (*store.Store, error) {
+	s, err := store.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if c := embed.FromEnv(); c != nil {
+		s.SetEmbedder(c)
+	}
+	return s, nil
+}
+
 var (
-	storeNew      = store.New
+	storeNew      = newStoreFromEnv
 	newHTTPServer = server.New
 	startHTTP     = (*server.Server).Start
 
@@ -86,8 +100,8 @@ var (
 	setupAddClaudeCodeAllowlist = setup.AddClaudeCodeAllowlist
 	scanInputLine               = fmt.Scanln
 
-	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
-		return s.Search(query, opts)
+	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, store.SearchInfo, error) {
+		return s.SearchWithInfo(query, opts)
 	}
 	storeAddObservation    = func(s *store.Store, p store.AddObservationParams) (int64, error) { return s.AddObservation(p) }
 	storeDeleteObservation = func(s *store.Store, id int64, hard bool) error { return s.DeleteObservation(id, hard) }
@@ -101,9 +115,15 @@ var (
 	}
 	storeFormatContext = func(s *store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
 	storeStats         = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
-	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
-	jsonMarshalIndent  = json.MarshalIndent
-	runDiagnostics     = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
+	storePrune         = func(s *store.Store, project, typeFilter string, limit int) ([]store.Observation, error) {
+		return s.ObservationsPastDecay(project, typeFilter, limit)
+	}
+	storeImmortalAudit = func(s *store.Store, project, typeFilter string, limit int) ([]store.Observation, error) {
+		return s.ImmortalObservations(project, typeFilter, limit)
+	}
+	storeExport       = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+	jsonMarshalIndent = json.MarshalIndent
+	runDiagnostics    = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
 		runner := diagnostic.NewRunner()
 		scope := diagnostic.Scope{Store: s, Project: project, Now: time.Now()}
 		if strings.TrimSpace(check) != "" {
@@ -647,6 +667,8 @@ func main() {
 		cmdContext(cfg)
 	case "stats":
 		cmdStats(cfg)
+	case "prune":
+		cmdPrune(cfg)
 	case "export":
 		cmdExport(cfg)
 	case "import":
@@ -711,8 +733,29 @@ func handleConfigFreeCommand(args []string) bool {
 	return false
 }
 
+// isForkBuild reports whether this binary is the local semantic-search fork
+// (version stamped with "-semantic" via ldflags at build time).
+func isForkBuild() bool {
+	return strings.Contains(version, "semantic")
+}
+
 func printUpdateCheckResult(result versioncheck.CheckResult) {
-	if result.Status != versioncheck.StatusUpToDate && result.Message != "" {
+	if result.Status == versioncheck.StatusUpToDate {
+		return
+	}
+	// Fork guard: this binary is the standalone semantic-search fork, and
+	// /opt/homebrew/bin/engram is a symlink into the fork's dist/. Following
+	// upstream's normal update advice (`brew upgrade engram`) would replace
+	// that symlink and silently revert to a build without semantic search.
+	if isForkBuild() && result.Status == versioncheck.StatusUpdateAvailable {
+		fmt.Fprintln(os.Stderr, "engram: upstream has released a newer version, but you are running the local semantic-search fork.")
+		fmt.Fprintln(os.Stderr, "  DO NOT run `brew upgrade engram` — it would replace this fork with a build that has no semantic search.")
+		fmt.Fprintln(os.Stderr, "  To take the upstream update: rebase the fork (~/Documents/GitHub/engram, branch feature/semantic-search),")
+		fmt.Fprintln(os.Stderr, "  then rebuild: go build -o dist/engram ./cmd/engram")
+		fmt.Fprintln(os.Stderr)
+		return
+	}
+	if result.Message != "" {
 		fmt.Fprintln(os.Stderr, result.Message)
 		fmt.Fprintln(os.Stderr)
 	}
@@ -976,18 +1019,23 @@ func cmdSearch(cfg store.Config) {
 	}
 	defer s.Close()
 
-	results, err := storeSearch(s, query, opts)
+	results, searchInfo, err := storeSearch(s, query, opts)
 	if err != nil {
 		fatal(err)
 		return
 	}
 
+	modeNote := searchInfo.Mode
+	if searchInfo.Degraded {
+		modeNote = fmt.Sprintf("%s — semantic ranking unavailable (%s); keyword results only", searchInfo.Mode, searchInfo.DegradedReason)
+	}
+
 	if len(results) == 0 {
-		fmt.Printf("No memories found for: %q\n", query)
+		fmt.Printf("No memories found for: %q (mode: %s)\n", query, modeNote)
 		return
 	}
 
-	fmt.Printf("Found %d memories:\n\n", len(results))
+	fmt.Printf("Found %d memories (mode: %s):\n\n", len(results), modeNote)
 	for i, r := range results {
 		project := ""
 		if r.Project != nil {
@@ -1432,6 +1480,170 @@ func cmdStats(cfg store.Config) {
 	fmt.Printf("  Prompts:      %d\n", stats.TotalPrompts)
 	fmt.Printf("  Projects:     %s\n", projects)
 	fmt.Printf("  Database:     %s/engram.db\n", cfg.DataDir)
+}
+
+// cmdPrune surfaces the review queue — observations past their decay horizon — for
+// triage. It deliberately does NOT delete: pruning stays LLM-judged. The agent (or
+// human) reads the list and runs `engram delete <id>` on the noise, extracting any
+// durable value into a typed note first.
+//
+// --immortal flips the lens: instead of the decay queue it lists observations of
+// types with NO decay horizon (architecture/pattern/bugfix/bug/…). These never
+// surface on their own, so this audit is their only safety net — run it when the
+// architecture materially changes (e.g. before a production push) and update
+// notes that no longer match reality.
+func cmdPrune(cfg store.Config) {
+	project := ""
+	typeFilter := ""
+	limit := 50
+	asJSON := false
+	immortal := false
+
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--project":
+			if i+1 < len(os.Args) {
+				project = os.Args[i+1]
+				i++
+			}
+		case "--type":
+			if i+1 < len(os.Args) {
+				typeFilter = os.Args[i+1]
+				i++
+			}
+		case "--limit":
+			if i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					limit = n
+				}
+				i++
+			}
+		case "--json":
+			asJSON = true
+		case "--immortal":
+			immortal = true
+		}
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	var obs []store.Observation
+	if immortal {
+		obs, err = storeImmortalAudit(s, project, typeFilter, limit)
+	} else {
+		obs, err = storePrune(s, project, typeFilter, limit)
+	}
+	if err != nil {
+		fatal(err)
+		return
+	}
+
+	if asJSON {
+		type pruneItem struct {
+			ID          int64   `json:"id"`
+			Type        string  `json:"type"`
+			Project     string  `json:"project,omitempty"`
+			Title       string  `json:"title"`
+			CreatedAt   string  `json:"created_at"`
+			UpdatedAt   string  `json:"updated_at,omitempty"`
+			ReviewAfter *string `json:"review_after,omitempty"`
+			AgeDays     int     `json:"age_days"`
+			Pinned      bool    `json:"pinned,omitempty"`
+		}
+		items := make([]pruneItem, 0, len(obs))
+		for _, o := range obs {
+			p := ""
+			if o.Project != nil {
+				p = *o.Project
+			}
+			items = append(items, pruneItem{
+				ID: o.ID, Type: o.Type, Project: p, Title: o.Title,
+				CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt, ReviewAfter: o.ReviewAfter,
+				AgeDays: ageDays(o.CreatedAt), Pinned: o.Pinned,
+			})
+		}
+		out, err := jsonMarshalIndent(items, "", "  ")
+		if err != nil {
+			fatal(err)
+			return
+		}
+		fmt.Println(string(out))
+		return
+	}
+
+	if len(obs) == 0 {
+		if immortal {
+			fmt.Println("No immortal-type observations found.")
+		} else {
+			fmt.Println("Nothing past its review horizon. Memory is tidy. ✨")
+		}
+		return
+	}
+
+	if immortal {
+		fmt.Printf("%d immortal-type observation(s) — least-recently-updated first:\n\n", len(obs))
+	} else {
+		fmt.Printf("%d observation(s) past their review horizon (oldest first):\n\n", len(obs))
+	}
+	order := []string{}
+	byType := map[string][]store.Observation{}
+	for _, o := range obs {
+		if _, ok := byType[o.Type]; !ok {
+			order = append(order, o.Type)
+		}
+		byType[o.Type] = append(byType[o.Type], o)
+	}
+	for _, t := range order {
+		fmt.Printf("[%s]\n", t)
+		for _, o := range byType[t] {
+			p := ""
+			if o.Project != nil {
+				p = *o.Project
+			}
+			pin := "  "
+			if o.Pinned {
+				pin = "📌"
+			}
+			fmt.Printf("  #%-5d %s %-16s %4dd  %s\n", o.ID, pin, truncate(p, 16), ageDays(o.CreatedAt), truncate(o.Title, 72))
+		}
+		fmt.Println()
+	}
+	if immortal {
+		fmt.Println("These types never decay — this audit is their only review. Re-read each note that touches")
+		fmt.Println("the changed area and update it (MCP mem_update) to match the current architecture; delete")
+		fmt.Println("(`engram delete <id>`) only if truly obsolete. Never leave a note describing a dead approach.")
+	} else {
+		fmt.Println("Triage each: `engram delete <id>` to prune (soft-delete, recoverable) — extract any durable")
+		fmt.Println("bug-class / invariant into a typed note first. Pinned observations are never listed.")
+	}
+}
+
+// ageDays returns whole days since createdAt; 0 if unparseable or in the future.
+func ageDays(createdAt string) int {
+	t, err := parseCmdTime(createdAt)
+	if err != nil {
+		return 0
+	}
+	d := time.Since(t).Hours() / 24
+	if d < 0 {
+		return 0
+	}
+	return int(d)
+}
+
+// parseCmdTime parses the timestamp formats engram stores observations with.
+func parseCmdTime(s string) (time.Time, error) {
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339, "2006-01-02T15:04:05Z07:00"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized time %q", s)
 }
 
 func cmdExport(cfg store.Config) {
@@ -2559,6 +2771,13 @@ Commands:
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
+  prune              List observations past their review horizon for triage
+                       [--project P] [--type T] [--limit N] [--json] [--immortal]
+                       Surfacing only — deletion stays a deliberate 'engram delete <id>' step
+                       so pruning remains judged, not blind-TTL.
+                       --immortal lists never-decaying types (architecture/pattern/bugfix/bug)
+                       instead: run after material architecture changes (e.g. before a
+                       production push) and update notes that no longer match reality.
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
   projects list      List all projects with observation, session, and prompt counts

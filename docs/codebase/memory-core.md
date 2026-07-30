@@ -48,6 +48,7 @@ For schema details, use [DOCS.md — Database Schema](../../DOCS.md#database-sch
 - Soft delete (`deleted_at`) hides data without physically deleting it unless explicit hard delete is used.
 - Write tools resolve the project from cwd/config; do not invent a project when there is ambiguity.
 - Search is progressive: compact results first, `mem_get_observation` only when full content is needed.
+- Successful saves are compact-safe: agents keep `engram:obs/<id>` pointers and may drop investigative trails; `FormatContext` surfaces a session durable ledger for pointer-first recovery after compaction.
 
 ## Local store change checklist
 

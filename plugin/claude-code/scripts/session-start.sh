@@ -170,8 +170,20 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - User mentions a topic you have no context on
 - User's FIRST message references the project, a feature, or a problem — call `mem_search` with keywords from their message to check for prior work before responding
 
+### COMPACT-SAFE — after each mem_save
+Envelope returns compact_safe=true and pointer engram:obs/<id>. Drop investigative trail; keep pointer. Rehydrate with mem_get_observation.
+
 ### SESSION CLOSE — before saying "done":
-Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+1. `mem_save` any still-unsaved durable facts FIRST — the summary is session metadata (shown in recent context), NOT searchable memory
+2. Call `mem_session_summary` with: Durable Coverage (engram:obs/<id> pointers), Goal, Discoveries, Accomplished, Next Steps, Relevant Files. Do not restate full compact_safe bodies.
+
+### AFTER COMPACTION
+mem_save remaining durable facts → pointer-first mem_session_summary → mem_context (Durable this session) → continue.
+
+### PRODUCTION PUSH — immortal-note audit
+Immortal types (architecture, pattern, bugfix, bug) never decay; nothing ever flags them for review. A production push locks in the approach — re-verify them then:
+- Before pushing/merging to the production (deploy) branch, if this session or branch materially changed architecture or approach: run `engram prune --immortal --project <project>` and re-read notes touching the changed area.
+- Update stale notes (`mem_update`) to match the new reality, or delete truly obsolete ones (`engram delete <id>`). Never leave an immortal note describing a dead approach.
 PROTOCOL
 
 # Inject memory context if available

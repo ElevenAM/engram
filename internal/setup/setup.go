@@ -176,7 +176,12 @@ Also search memory PROACTIVELY when:
 ### SESSION CLOSE PROTOCOL (mandatory)
 
 Before ending a session or saying "done" / "listo" / "that's it", you MUST:
-1. Call mem_session_summary with this structure:
+1. Save any still-unsaved durable facts via mem_save FIRST — the summary is session metadata (shown in recent context), NOT searchable memory
+2. Call mem_session_summary with this structure:
+
+## Durable Coverage
+- engram:obs/<id> — [short title of each compact_safe save]
+(Pointers only — do NOT restate full content of facts already saved via mem_save)
 
 ## Goal
 [What we were working on this session]
@@ -185,10 +190,10 @@ Before ending a session or saying "done" / "listo" / "that's it", you MUST:
 [User preferences or constraints discovered — skip if none]
 
 ## Discoveries
-- [Technical findings, gotchas, non-obvious learnings]
+- [Technical findings NOT already under Durable Coverage]
 
 ## Accomplished
-- [Completed items with key details]
+- [Completed items; prefer pointers for saved facts]
 
 ## Next Steps
 - [What remains to be done — for the next session]
@@ -197,6 +202,20 @@ Before ending a session or saying "done" / "listo" / "that's it", you MUST:
 - path/to/file — [what it does or what changed]
 
 This is NOT optional. If you skip this, the next session starts blind.
+
+### COMPACT-SAFE / SAVE-THEN-FORGET
+
+After every successful mem_save, the envelope includes compact_safe=true, id, and pointer (engram:obs/<id>):
+1. That fact is durable — drop the investigative trail from working context; keep the pointer
+2. Rehydrate with mem_get_observation — do not restate full compact_safe bodies in summaries
+3. Before compaction or session close: mem_save remaining durable facts FIRST, then pointer-first mem_session_summary
+
+### PRODUCTION PUSH — IMMORTAL-NOTE AUDIT
+
+Immortal types (architecture, pattern, bugfix, bug) never decay, so nothing ever flags them for review. A production push locks in the current approach — re-verify them then:
+1. Before pushing/merging to the production (deploy) branch, ask: did this session or branch materially change the architecture or approach?
+2. If yes: run engram prune --immortal --project <project> and re-read the notes touching the changed area.
+3. Update stale notes to match the new reality (mem_update), or delete truly obsolete ones (engram delete <id>). Never leave an immortal note describing a dead approach.
 
 ### PASSIVE CAPTURE — automatic learning extraction
 
@@ -215,27 +234,29 @@ This is a safety net — it captures knowledge even if you forget to call mem_sa
 ### AFTER COMPACTION
 
 If you see a message about compaction or context reset, or if you see "FIRST ACTION REQUIRED" in your context:
-1. IMMEDIATELY call mem_session_summary with the compacted summary content — this persists what was done before compaction
-2. Then call mem_context to recover any additional context from previous sessions
-3. Only THEN continue working
+1. mem_save any durable facts from the compacted summary that are not yet pointers
+2. Call mem_session_summary with a pointer-first recap (## Durable Coverage with engram:obs/<id> lines + working state only)
+3. Call mem_context — read Durable this session pointers; rehydrate with mem_get_observation as needed
+4. Only THEN continue working
 
-Do not skip step 1. Without it, everything done before compaction is lost from memory.
+Do not skip durable saves. Without them, compaction is lossy amnesia instead of safe eviction.
 `
 
 const codexCompactPromptMarkdown = `You are compacting a coding session that uses Engram persistent memory.
 
-You MUST prepend this exact sentence at the top of the compacted summary:
+You MUST prepend this exact block at the top of the compacted summary:
 
-FIRST ACTION REQUIRED: Call mem_session_summary with the content of this compacted summary before doing anything else, then call mem_context.
+FIRST ACTION REQUIRED: (1) mem_save any durable decisions/bugs/gotchas not already saved (each returns compact_safe + engram:obs/<id>). (2) Call mem_session_summary with a pointer-first recap: ## Durable Coverage listing engram:obs/<id> lines, then Goal/working state only — do not restate full compact_safe bodies. (3) Call mem_context and read Durable this session pointers; rehydrate with mem_get_observation as needed. Do this BEFORE any other work.
 
-After that sentence, summarize:
+After that block, summarize:
+- Durable Coverage pointers (engram:obs/<id>)
 - Goal
-- Key technical discoveries and decisions
+- Key technical discoveries and decisions not already under Durable Coverage
 - Completed work
 - Remaining next steps
 - Relevant files changed
 
-Keep it concise and high-signal.`
+Keep it concise and high-signal. Prefer pointers over restating compact_safe content.`
 
 // SupportedAgents returns the list of agents that have plugins available.
 // The list is derived from the registry (agentAdapters) so adding an agent there

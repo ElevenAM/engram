@@ -173,8 +173,8 @@ func stubRuntimeHooks(t *testing.T) {
 	setupSupportedAgents = setup.SupportedAgents
 	setupInstallAgent = setup.Install
 	scanInputLine = fmt.Scanln
-	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
-		return s.Search(query, opts)
+	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, store.SearchInfo, error) {
+		return s.SearchWithInfo(query, opts)
 	}
 	storeAddObservation = func(s *store.Store, p store.AddObservationParams) (int64, error) {
 		return s.AddObservation(p)
@@ -3870,8 +3870,8 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("search seam error", func(t *testing.T) {
 		withArgs(t, "engram", "search", "needle")
-		storeSearch = func(*store.Store, string, store.SearchOptions) ([]store.SearchResult, error) {
-			return nil, errors.New("forced search error")
+		storeSearch = func(*store.Store, string, store.SearchOptions) ([]store.SearchResult, store.SearchInfo, error) {
+			return nil, store.SearchInfo{}, errors.New("forced search error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSearch(cfg) })
 		assertFatal(t, stderr, recovered, "forced search error")
