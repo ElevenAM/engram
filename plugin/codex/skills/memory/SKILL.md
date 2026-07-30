@@ -74,6 +74,14 @@ Format for `mem_save`:
 - If unsure about the key, call `mem_suggest_topic_key` first, then reuse that key consistently
 - If you already know the exact ID to fix, use `mem_update`
 
+### COMPACT-SAFE / SAVE-THEN-FORGET (mandatory)
+
+After every successful `mem_save`, the response envelope includes `compact_safe: true`, `id`, and `pointer` (`engram:obs/<id>`):
+
+1. That fact is **durable** — drop the investigative trail from working context; keep the pointer
+2. Rehydrate full content later with `mem_get_observation(id)` — do not restate full compact_safe bodies in summaries
+3. Before compaction or session close: `mem_save` any remaining durable facts FIRST, then write a **pointer-first** `mem_session_summary`
+
 ## WHEN TO SEARCH MEMORY
 
 When the user asks to recall something — any variation of "remember", "recall", "what did we do",
@@ -93,6 +101,10 @@ Before ending a session or saying "done" / "that's it", you MUST:
 1. Save any still-unsaved durable facts (decisions, gotchas, patterns, bugs) via `mem_save` — the summary is session metadata shown in recent context, NOT searchable memory
 2. Call `mem_session_summary` with this structure:
 
+## Durable Coverage
+- engram:obs/<id> — [short title of each compact_safe save]
+(Pointers only — do NOT restate full content of facts already saved via mem_save)
+
 ## Goal
 [What we were working on this session]
 
@@ -100,10 +112,10 @@ Before ending a session or saying "done" / "that's it", you MUST:
 [User preferences or constraints discovered — skip if none]
 
 ## Discoveries
-- [Technical findings, gotchas, non-obvious learnings]
+- [Technical findings NOT already under Durable Coverage]
 
 ## Accomplished
-- [Completed items with key details]
+- [Completed items; prefer pointers for saved facts]
 
 ## Next Steps
 - [What remains to be done — for the next session]
@@ -124,9 +136,10 @@ Immortal types (architecture, pattern, bugfix, bug) never decay, so nothing ever
 ## AFTER COMPACTION
 
 If you see a message about compaction or context reset:
-1. IMMEDIATELY call `mem_session_summary` with the compacted summary content — this persists what was done before compaction
-2. Then call `mem_context` to recover any additional context from previous sessions
-3. Only THEN continue working
+1. `mem_save` any durable facts from the compacted summary that are not yet pointers (decisions, bugs, gotchas) — get compact_safe certificates
+2. Call `mem_session_summary` with a **pointer-first** recap (`## Durable Coverage` with `engram:obs/<id>` lines + working state only)
+3. Call `mem_context` — read **Durable this session** and recent pointer lines; rehydrate with `mem_get_observation` as needed
+4. Only THEN continue working
 
-Do not skip step 1. Without it, everything done before compaction is lost from memory.
+Do not skip durable saves. Without them, compaction is lossy amnesia instead of safe eviction.
 All core tools are loaded automatically by the hook at session start. If they are unexpectedly missing, rerun `engram setup codex` and restart Codex.

@@ -60,24 +60,27 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - Starting work on something that might have been done before
 - User mentions a topic you have no context on
 
+### COMPACT-SAFE
+After mem_save: envelope has compact_safe=true and pointer engram:obs/<id>. Keep pointer; drop investigative trail. Rehydrate with mem_get_observation.
+
 ### SESSION CLOSE — before saying "done":
-Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+mem_save durable facts FIRST, then mem_session_summary with Durable Coverage (engram:obs/<id> pointers) + Goal/working state.
 
 ---
 
 CRITICAL INSTRUCTION POST-COMPACTION — follow these steps IN ORDER:
 PROTOCOL
 
-printf "\n1. FIRST: Call mem_session_summary with the content of the compacted summary above. Use project: '%s'.\n" "$PROJECT"
-printf "   This preserves what was accomplished before compaction.\n\n"
-printf "2. THEN: Call mem_context with project: '%s' to recover recent session history and observations.\n" "$PROJECT"
-printf "   Read the returned context carefully — it tells you what was being worked on.\n\n"
+printf "\n1. FIRST: mem_save any durable decisions/bugs/gotchas from the compacted summary that are not yet saved (each returns compact_safe + engram:obs/<id>). Use project: '%s'.\n" "$PROJECT"
+printf "\n2. THEN: Call mem_session_summary with a POINTER-FIRST recap: ## Durable Coverage listing engram:obs/<id> lines, then Goal/working state only — do NOT restate full compact_safe bodies. Project: '%s'.\n" "$PROJECT"
+printf "\n3. THEN: Call mem_context with project: '%s' — read Durable this session and pointer lines; rehydrate with mem_get_observation as needed.\n" "$PROJECT"
 cat <<'PROTOCOL'
-3. If you need more detail on a specific topic, call mem_search with relevant keywords.
 
-4. Only THEN continue working on what the user asked.
+4. If you need more detail on a specific topic, call mem_search with relevant keywords.
 
-All 4 steps are MANDATORY. Without them, you lose context and start blind.
+5. Only THEN continue working on what the user asked.
+
+All steps are MANDATORY. Without durable saves + pointers, compaction is lossy amnesia.
 PROTOCOL
 
 # Inject memory context if available

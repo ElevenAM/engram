@@ -190,6 +190,15 @@ DEFERRED TOOLS (use ToolSearch when needed):
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.
 
+## COMPACT-SAFE / SAVE-THEN-FORGET
+
+After every successful mem_save, the envelope includes compact_safe=true and pointer (engram:obs/<id>).
+That fact is durable: drop the investigative trail from working context; keep the pointer.
+Rehydrate with mem_get_observation when full detail is needed again.
+Before compaction or session close: mem_save any remaining durable facts FIRST, then write a pointer-first mem_session_summary
+(## Durable Coverage with engram:obs/<id> lines — do not restate full content of compact_safe items).
+mem_context lists "Durable this session" coverage for recovery after compaction.
+
 ## CONFLICT SURFACING — when mem_save returns candidates
 
 After every mem_save call, check the response envelope for judgment_required.
@@ -315,6 +324,11 @@ WHEN to save (call this after each of these):
 - Configuration changes or environment setup
 - Important discoveries or gotchas
 - File structure changes
+
+AFTER SAVE (compact-safe certificate):
+Successful saves return envelope fields compact_safe=true, id, pointer (engram:obs/<id>).
+The fact is durable — drop the investigative trail from working context; keep the pointer.
+Rehydrate later with mem_get_observation(id). Do not restate full compact_safe content in mem_session_summary; list the pointer under ## Durable Coverage.
 
 FORMAT for content — use this structured format:
   **What**: [concise description of what was done]
@@ -542,7 +556,7 @@ Examples:
 	if shouldRegister("mem_context", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_context",
-				mcp.WithDescription("Get recent memory context from previous sessions. Shows recent sessions and observations to understand what was done before."),
+				mcp.WithDescription("Get recent memory context from previous sessions. Includes Durable this session (compact-safe engram:obs/<id> pointers), pinned and recent observations with pointers, session recaps, and prompts. After compaction, call this to recover pointer coverage — rehydrate full content with mem_get_observation."),
 				mcp.WithTitleAnnotation("Get Memory Context"),
 				mcp.WithReadOnlyHintAnnotation(true),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -640,6 +654,10 @@ Examples:
 
 FORMAT — use this exact structure in the content field:
 
+## Durable Coverage
+- engram:obs/<id> — [short title of compact_safe save]
+(List pointers only for facts already saved via mem_save. Do NOT restate their full content.)
+
 ## Goal
 [One sentence: what were we building/working on in this session]
 
@@ -647,12 +665,11 @@ FORMAT — use this exact structure in the content field:
 [User preferences, constraints, or context discovered during this session. Things a future agent needs to know about HOW the user wants things done. Skip if nothing notable.]
 
 ## Discoveries
-- [Technical finding, gotcha, or learning 1]
-- [Technical finding 2]
+- [Technical finding, gotcha, or learning 1 — only items NOT already under Durable Coverage]
 - [Important API behavior, config quirk, etc.]
 
 ## Accomplished
-- ✅ [Completed task 1 — with key implementation details]
+- ✅ [Completed task 1 — with key implementation details; prefer pointers for saved facts]
 - ✅ [Completed task 2 — mention files changed]
 - 🔲 [Identified but not yet done — for next session]
 
@@ -667,7 +684,7 @@ GUIDELINES:
 - Be CONCISE but don't lose important details (file paths, error messages, decisions)
 - Focus on WHAT and WHY, not HOW (the code itself is in the repo)
 - Include things that would save a future agent time
-- The Discoveries section is the most valuable — capture gotchas and non-obvious learnings
+- The Discoveries section is the most valuable for UNSAVED working state — durable facts belong in mem_save + Durable Coverage pointers
 - Relevant Files should only include files that were significantly changed or are important for context`),
 				mcp.WithString("content",
 					mcp.Required(),
@@ -1351,16 +1368,31 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
 		}
 
-		// Fetch the saved observation's sync_id for the envelope (REQ-001).
-		var savedSyncID string
+		// compact_safe certificate is tied to the successful write (savedID),
+		// not to a successful reload. Agents key off these fields to drop
+		// investigative trails; omitting them on a reload blip would be a
+		// silent half-success.
+		extra["id"] = savedID
+		extra["compact_safe"] = true
+		extra["pointer"] = store.ObservationPointer(savedID)
+		msg += fmt.Sprintf(
+			"\ncompact_safe: durable at %s. Drop investigative trail from working context; rehydrate with mem_get_observation if needed.",
+			store.ObservationPointer(savedID),
+		)
+		// Best-effort enrichment from the reloaded row (sync_id, title, state…).
 		if obs, obsErr := s.GetObservation(savedID); obsErr == nil {
-			savedSyncID = obs.SyncID
-			extra["id"] = savedID
-			extra["sync_id"] = savedSyncID
+			extra["sync_id"] = obs.SyncID
 			extra["state"] = obs.State()
+			extra["title"] = obs.Title
+			extra["type"] = obs.Type
+			if obs.TopicKey != nil && strings.TrimSpace(*obs.TopicKey) != "" {
+				extra["topic_key"] = *obs.TopicKey
+			}
 			if obs.ReviewAfter != nil {
 				extra["review_after"] = *obs.ReviewAfter
 			}
+		} else {
+			fmt.Fprintf(os.Stderr, "engram: GetObservation after save id=%d (non-fatal): %v\n", savedID, obsErr)
 		}
 
 		if len(candidates) > 0 {

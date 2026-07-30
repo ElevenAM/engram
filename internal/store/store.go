@@ -2312,7 +2312,15 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 }
 
 // SessionObservations returns all observations for a specific session.
+// Empty sessionID returns nil without querying. limit <= 0 defaults to 200
+// (TUI browse window); callers that want MaxContextResults should pass it.
+// Order is chronological ASC for TUI browsing. FormatContext durable ledger
+// uses SessionDurableLedger (newest-first under a tight cap) instead.
 func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, nil
+	}
 	if limit <= 0 {
 		limit = 200
 	}
@@ -2325,6 +2333,53 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 		LIMIT ?
 	`
 	return s.queryObservations(query, sessionID, limit)
+}
+
+// SessionDurableLedger returns the newest non-deleted observations for a
+// session (newest first), with scope filtered in SQL before LIMIT so mixed-scope
+// sessions do not under-fill the window. total is the full matching count
+// before LIMIT (for truncation messaging). Empty sessionID returns nil, 0, nil.
+func (s *Store) SessionDurableLedger(sessionID, scope string, limit int) ([]Observation, int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, 0, nil
+	}
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+		if limit <= 0 {
+			limit = 20
+		}
+	}
+
+	countQuery := `SELECT COUNT(*) FROM observations WHERE session_id = ? AND deleted_at IS NULL`
+	countArgs := []any{sessionID}
+	if scope != "" {
+		countQuery += " AND scope = ?"
+		countArgs = append(countArgs, normalizeScope(scope))
+	}
+	var total int
+	if err := s.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations
+		WHERE session_id = ? AND deleted_at IS NULL
+	`
+	args := []any{sessionID}
+	if scope != "" {
+		query += " AND scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+	query += " ORDER BY datetime(created_at) DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	obs, err := s.queryObservations(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	return obs, total, nil
 }
 
 // ─── Observations ────────────────────────────────────────────────────────────
@@ -2613,6 +2668,27 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]
 	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
 	return s.queryObservations(query, args...)
+}
+
+// ObservationPointer returns the canonical compact-safe pointer for an observation ID.
+// Agents and compactors should keep this token in working context and rehydrate via
+// mem_get_observation instead of restating full durable content.
+func ObservationPointer(id int64) string {
+	return fmt.Sprintf("engram:obs/%d", id)
+}
+
+// formatObservationPointerLine renders a compact-safe ledger line.
+// When contentLimit > 0, a truncated body is appended after the title.
+func formatObservationPointerLine(obs Observation, contentLimit int) string {
+	topic := ""
+	if obs.TopicKey != nil && strings.TrimSpace(*obs.TopicKey) != "" {
+		topic = fmt.Sprintf(" topic=%s", *obs.TopicKey)
+	}
+	line := fmt.Sprintf("- %s [%s] **%s**%s", ObservationPointer(obs.ID), obs.Type, obs.Title, topic)
+	if contentLimit > 0 {
+		line += fmt.Sprintf(": %s", truncate(obs.Content, contentLimit))
+	}
+	return line
 }
 
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
@@ -3606,13 +3682,51 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
+	// Session durable ledger: newest compact-safe facts for the active (or
+	// fallback) session. Pointer-only — do not restate full bodies here.
+	var sessionDurable []Observation
+	var sessionDurableTotal int
+	var durableHeading string // empty when no ledger section
+	if project != "" {
+		var sessionDurableID string
+		if sid, ok, sessErr := s.MostRecentActiveSession(project); sessErr == nil && ok {
+			sessionDurableID = sid
+			durableHeading = "### Durable this session (safe to pointer-compact)\n"
+		} else if len(sessions) > 0 && sessions[0].ObservationCount > 0 {
+			// No open harness session — surface latest session with
+			// observations (label must not claim "this session").
+			sessionDurableID = sessions[0].ID
+			durableHeading = "### Durable coverage (latest session) (safe to pointer-compact)\n"
+		} else {
+			// Implicit MCP writes land on manual-save-{project}.
+			sessionDurableID = "manual-save-" + project
+			durableHeading = "### Durable coverage (manual-save) (safe to pointer-compact)\n"
+		}
+		sessionDurable, sessionDurableTotal, err = s.SessionDurableLedger(sessionDurableID, scope, s.cfg.MaxContextResults)
+		if err != nil {
+			return "", err
+		}
+		if len(sessionDurable) == 0 {
+			durableHeading = ""
+		}
+	}
+
+	// IDs already shown as pointer-only under the durable ledger must not
+	// reappear under Pinned/Recent with 300-char bodies (token regression).
+	durableIDs := make(map[int64]struct{}, len(sessionDurable))
+	for _, obs := range sessionDurable {
+		durableIDs[obs.ID] = struct{}{}
+	}
+	pinned = filterObservationsNotIn(pinned, durableIDs)
+	observations = filterObservationsNotIn(observations, durableIDs)
+
 	reviewCount, _ := s.CountObservationsPastReview(project)
 	// Gate the maintenance nudge: a small backlog on every context load is
 	// itself noise. Only nag once the queue is meaningfully backed up, which
 	// also batches triage into fewer, larger passes.
 	showMaintenance := reviewCount > maintenanceNudgeThreshold
 
-	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && !showMaintenance {
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 && len(sessionDurable) == 0 && !showMaintenance {
 		return "", nil
 	}
 
@@ -3641,6 +3755,20 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	if len(sessionDurable) > 0 && durableHeading != "" {
+		b.WriteString(durableHeading)
+		b.WriteString("These facts are already on the Engram durable path. Keep the pointer; drop investigative trails. Rehydrate with mem_get_observation(id).\n")
+		for _, obs := range sessionDurable {
+			b.WriteString(formatObservationPointerLine(obs, 0))
+			b.WriteByte('\n')
+		}
+		if sessionDurableTotal > len(sessionDurable) {
+			fmt.Fprintf(&b, "Count: %d of %d (showing newest) — unsaved working state is NOT listed.\n\n", len(sessionDurable), sessionDurableTotal)
+		} else {
+			fmt.Fprintf(&b, "Count: %d — unsaved working state is NOT listed.\n\n", len(sessionDurable))
+		}
+	}
+
 	if len(prompts) > 0 {
 		b.WriteString("### Recent User Prompts\n")
 		for _, p := range prompts {
@@ -3652,8 +3780,8 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(pinned) > 0 {
 		b.WriteString("### Pinned\n")
 		for _, obs := range pinned {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			b.WriteString(formatObservationPointerLine(obs, 300))
+			b.WriteByte('\n')
 		}
 		b.WriteString("\n")
 	}
@@ -3661,8 +3789,8 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			b.WriteString(formatObservationPointerLine(obs, 300))
+			b.WriteByte('\n')
 		}
 		b.WriteString("\n")
 	}
@@ -3672,6 +3800,21 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+// filterObservationsNotIn returns obs excluding any id present in skip.
+func filterObservationsNotIn(obs []Observation, skip map[int64]struct{}) []Observation {
+	if len(skip) == 0 || len(obs) == 0 {
+		return obs
+	}
+	out := make([]Observation, 0, len(obs))
+	for _, o := range obs {
+		if _, drop := skip[o.ID]; drop {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
 }
 
 // ─── Export / Import ─────────────────────────────────────────────────────────

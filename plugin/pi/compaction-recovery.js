@@ -51,9 +51,11 @@ export function recoveryInstruction(project) {
   return (
     `CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\n` +
     `The agent has access to Engram persistent memory via MCP tools when gentle-engram and the Engram MCP tools are installed and active.\n` +
-    `FIRST ACTION REQUIRED: Call mem_session_summary with the content of this compacted summary. ` +
-    `Use project: '${project}'. This preserves what was accomplished before compaction. Do this BEFORE any other work.\n` +
-    `If mem_session_summary is unavailable, manually save this compacted summary once Engram tools are available.`
+    `FIRST ACTION REQUIRED: (1) mem_save any durable decisions/bugs/gotchas not already saved (each returns compact_safe + engram:obs/<id>). ` +
+    `(2) Call mem_session_summary with a pointer-first recap: ## Durable Coverage listing engram:obs/<id> lines, then Goal/working state only — do not restate full compact_safe bodies. ` +
+    `(3) Call mem_context and read Durable this session pointers; rehydrate with mem_get_observation as needed. ` +
+    `Use project: '${project}'. Do this BEFORE any other work.\n` +
+    `If Engram tools are unavailable, save this compacted summary once they are available.`
   );
 }
 

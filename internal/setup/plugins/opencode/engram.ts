@@ -73,6 +73,13 @@ Topic rules:
 - If unsure about the key, call \`mem_suggest_topic_key\` first and then reuse it
 - Use \`mem_update\` when you have an exact observation ID to correct
 
+### COMPACT-SAFE / SAVE-THEN-FORGET (mandatory)
+
+After every successful \`mem_save\`, the envelope includes \`compact_safe: true\`, \`id\`, and \`pointer\` (\`engram:obs/<id>\`):
+1. That fact is durable — drop the investigative trail from working context; keep the pointer
+2. Rehydrate with \`mem_get_observation(id)\` — do not restate full compact_safe bodies in summaries
+3. Before compaction or session close: \`mem_save\` remaining durable facts FIRST, then a pointer-first \`mem_session_summary\`
+
 ### WHEN TO SEARCH MEMORY
 
 When the user asks to recall something — any variation of "remember", "recall", "what did we do",
@@ -89,7 +96,12 @@ Also search memory PROACTIVELY when:
 ### SESSION CLOSE PROTOCOL (mandatory)
 
 Before ending a session or saying "done" / "that's it", you MUST:
-1. Call \`mem_session_summary\` with this structure:
+1. Save any still-unsaved durable facts (decisions, gotchas, patterns, bugs) via \`mem_save\` — the summary is session metadata shown in recent context, NOT searchable memory
+2. Call \`mem_session_summary\` with this structure:
+
+## Durable Coverage
+- engram:obs/<id> — [short title of each compact_safe save]
+(Pointers only — do NOT restate full content of facts already saved via mem_save)
 
 ## Goal
 [What we were working on this session]
@@ -98,10 +110,10 @@ Before ending a session or saying "done" / "that's it", you MUST:
 [User preferences or constraints discovered — skip if none]
 
 ## Discoveries
-- [Technical findings, gotchas, non-obvious learnings]
+- [Technical findings NOT already under Durable Coverage]
 
 ## Accomplished
-- [Completed items with key details]
+- [Completed items; prefer pointers for saved facts]
 
 ## Next Steps
 - [What remains to be done — for the next session]
@@ -111,14 +123,23 @@ Before ending a session or saying "done" / "that's it", you MUST:
 
 This is NOT optional. If you skip this, the next session starts blind.
 
+### PRODUCTION PUSH — IMMORTAL-NOTE AUDIT
+
+Immortal types (architecture, pattern, bugfix, bug) never decay, so nothing ever flags them for review. A production push locks in the current approach — that is the moment to re-verify them:
+
+1. Before pushing/merging to the production (deploy) branch, ask: did this session or branch materially change the architecture or approach?
+2. If yes: run \`engram prune --immortal --project <project>\` and re-read the notes touching the changed area.
+3. Update stale notes to match the new reality (\`mem_update\`), or delete truly obsolete ones (\`engram delete <id>\`). Never leave an immortal note describing a dead approach.
+
 ### AFTER COMPACTION
 
 If you see a message about compaction or context reset, or if you see "FIRST ACTION REQUIRED" in your context:
-1. IMMEDIATELY call \`mem_session_summary\` with the compacted summary content — this persists what was done before compaction
-2. Then call \`mem_context\` to recover any additional context from previous sessions
-3. Only THEN continue working
+1. \`mem_save\` any durable facts from the compacted summary that are not yet pointers
+2. Call \`mem_session_summary\` with a pointer-first recap (\`## Durable Coverage\` with \`engram:obs/<id>\` lines + working state only)
+3. Call \`mem_context\` — read Durable this session / pointer lines; rehydrate with \`mem_get_observation\` as needed
+4. Only THEN continue working
 
-Do not skip step 1. Without it, everything done before compaction is lost from memory.
+Do not skip durable saves. Without them, compaction is lossy amnesia instead of safe eviction.
 `
 
 // ─── HTTP Client ─────────────────────────────────────────────────────────────
@@ -521,16 +542,17 @@ export const Engram: Plugin = async (ctx) => {
         output.context.push(data.context)
       }
 
-      // Tell the compressor to instruct the new agent to persist the
-      // compacted summary to Engram. The new agent reads the compacted
-      // summary and this instruction, then saves it as a session summary.
+      // Tell the compressor to instruct the new agent: durable mem_save first,
+      // then pointer-first session summary, then mem_context recovery.
       output.context.push(
         `CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\n` +
         `The agent has access to Engram persistent memory via MCP tools.\n` +
         `You MUST include the following instruction at the TOP of the compacted summary:\n\n` +
-        `"FIRST ACTION REQUIRED: Call mem_session_summary with the content of this compacted summary. ` +
-        `Use project: '${project}'. This preserves what was accomplished before compaction. Do this BEFORE any other work."\n\n` +
-        `This is NOT optional. Without this, everything done before compaction is lost from memory.`
+        `"FIRST ACTION REQUIRED: (1) mem_save any durable decisions/bugs/gotchas not already saved (each returns compact_safe + engram:obs/<id>). ` +
+        `(2) Call mem_session_summary with a pointer-first recap: ## Durable Coverage listing engram:obs/<id> lines, then Goal/working state only — do not restate full compact_safe bodies. ` +
+        `(3) Call mem_context and read Durable this session pointers; rehydrate with mem_get_observation as needed. ` +
+        `Use project: '${project}'. Do this BEFORE any other work."\n\n` +
+        `This is NOT optional. Without durable saves + pointers, compaction is lossy amnesia.`
       )
     },
   }

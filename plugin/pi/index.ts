@@ -71,6 +71,13 @@ Format for \`mem_save\`:
   **Where**: Files or paths affected
   **Learned**: Gotchas, edge cases, things that surprised you
 
+### COMPACT-SAFE / SAVE-THEN-FORGET
+
+After successful \`mem_save\`, envelope has \`compact_safe: true\` and \`pointer\` (\`engram:obs/<id>\`).
+Drop the investigative trail; keep the pointer. Rehydrate with \`mem_get_observation\`.
+Before compact/close: \`mem_save\` remaining durable facts, then pointer-first \`mem_session_summary\`
+(\`## Durable Coverage\` with engram:obs/<id> lines — do not restate full compact_safe content).
+
 ### WHEN TO SEARCH MEMORY
 
 When the user asks to recall past work, first call \`mem_context\`. If not found,
@@ -80,7 +87,7 @@ call \`mem_search\`, then \`mem_get_observation\` for full content.
 
 Before ending a session or saying "done", first \`mem_save\` any still-unsaved durable
 facts (the summary is session metadata, not searchable memory), then call \`mem_session_summary\`
-with Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
+with Durable Coverage (pointers), Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
 If \`mem_session_summary\` fails because Engram cannot detect a project, ask the user
 which project should receive the summary, then retry with \`project: "<name>"\`.
 
@@ -93,8 +100,8 @@ or delete truly obsolete ones (\`engram delete <id>\`).
 
 ### AFTER COMPACTION
 
-If you see "FIRST ACTION REQUIRED" or a compacted summary, save it immediately
-with \`mem_session_summary\`, then call \`mem_context\` before continuing.
+If you see "FIRST ACTION REQUIRED" or a compacted summary: \`mem_save\` durable facts first,
+then pointer-first \`mem_session_summary\`, then \`mem_context\` (read Durable this session) before continuing.
 `;
 
 interface FetchOptions {

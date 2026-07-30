@@ -86,6 +86,25 @@ Token-efficient memory retrieval — don't dump everything, drill in:
 3. mem_get_observation id=42       → full untruncated content
 ```
 
+## Compact-safe write-through (save-then-forget)
+
+Successful `mem_save` returns a **compact-safe certificate** in the tool envelope:
+
+```
+compact_safe: true
+id: 42
+pointer: engram:obs/42
+topic_key: architecture/auth-model   # when set
+```
+
+That means the fact is on the durable path. Agents should drop the investigative trail from working context, keep the pointer, and rehydrate with `mem_get_observation` when full detail is needed again.
+
+`mem_context` / `FormatContext` include a durable ledger of `engram:obs/<id>` lines (newest-first, scope filtered in SQL before LIMIT) for the active session, or a clearly labeled latest/manual-save fallback when no open harness session exists. Rows already listed there are omitted from Pinned/Recent so recovery is pointer-first without re-injecting 300-char bodies. Truncated windows report `Count: N of M (showing newest)`.
+
+`mem_session_summary` should list `## Durable Coverage` with pointers only for compact_safe items; Discoveries/Accomplished hold unsaved working state.
+
+The install-time OpenCode plugin is generated from `plugin/opencode/engram.ts` (`go:generate` in `internal/setup`); keep those copies in sync.
+
 ---
 
 ## Memory Hygiene
