@@ -2395,6 +2395,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	if len(content) > s.cfg.MaxObservationLength {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
 	}
+	if strings.TrimSpace(title) == "" {
+		title = deriveTitle(content)
+	}
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
@@ -3189,6 +3192,9 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 			if len(content) > s.cfg.MaxObservationLength {
 				content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
 			}
+		}
+		if strings.TrimSpace(title) == "" {
+			title = deriveTitle(content)
 		}
 		if p.Project != nil {
 			project, _ = NormalizeProject(*p.Project)
